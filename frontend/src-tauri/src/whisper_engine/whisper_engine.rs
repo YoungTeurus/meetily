@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use whisper_rs::{WhisperContext, WhisperContextParameters, WhisperToken, FullParams, SamplingStrategy};
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
@@ -14,6 +14,9 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use crate::config::WHISPER_MODEL_CATALOG;
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
+
+#[path = "initial_prompt.rs"]
+mod initial_prompt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModelStatus {
@@ -82,6 +85,22 @@ pub struct WhisperEngine {
 }
 
 impl WhisperEngine {
+    fn tokenize_initial_prompt(
+        context: &WhisperContext,
+        initial_prompt: Option<&str>,
+    ) -> Result<Vec<WhisperToken>> {
+        let (tokens, truncated) = initial_prompt::tokenize_prompt(initial_prompt, |text, capacity| {
+            context.tokenize(text, capacity)
+        })?;
+        if truncated {
+            log::warn!(
+                "Whisper vocabulary hints exceeded {} model tokens; keeping the first tokens",
+                initial_prompt::MAX_INITIAL_PROMPT_TOKENS,
+            );
+        }
+        Ok(tokens)
+    }
+
     /// Detect available GPU acceleration capabilities
     fn detect_gpu_acceleration() -> bool {
         match WhisperCompiledBackend::current() {
@@ -549,9 +568,24 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        self.transcribe_audio_with_confidence_and_prompt(audio_data, language, None).await
+    }
+
+    /// Supply optional vocabulary hints to the loaded model's actual tokenizer.
+    /// Existing callers without hints retain the previous decoding parameters.
+    pub async fn transcribe_audio_with_confidence_and_prompt(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+        initial_prompt: Option<&str>,
+    ) -> Result<(String, f32, bool)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
+
+        // Keep the token vector in this scope until state.full() has returned:
+        // FullParams borrows its slice and the native decoder reads that memory.
+        let prompt_tokens = Self::tokenize_initial_prompt(ctx, initial_prompt)?;
 
         // Get adaptive configuration based on hardware
         let hardware_profile = crate::audio::HardwareProfile::detect();
@@ -562,6 +596,9 @@ impl WhisperEngine {
             beam_size: adaptive_config.beam_size as i32,
             patience: 1.0
         });
+        if !prompt_tokens.is_empty() {
+            params.set_tokens(&prompt_tokens);
+        }
 
         // Configure with adaptive settings
         // If language is "auto" or None, use automatic language detection (pass None)
@@ -666,9 +703,23 @@ impl WhisperEngine {
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {
+        self.transcribe_audio_with_prompt(audio_data, language, None).await
+    }
+
+    /// Transcribe with optional vocabulary hints, limited to 224 model tokens.
+    pub async fn transcribe_audio_with_prompt(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+        initial_prompt: Option<&str>,
+    ) -> Result<String> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
+
+        // Keep the token vector in this scope until state.full() has returned:
+        // FullParams borrows its slice and the native decoder reads that memory.
+        let prompt_tokens = Self::tokenize_initial_prompt(ctx, initial_prompt)?;
 
         // Get adaptive configuration based on hardware
         let hardware_profile = crate::audio::HardwareProfile::detect();
@@ -679,6 +730,9 @@ impl WhisperEngine {
             beam_size: adaptive_config.beam_size as i32,
             patience: 1.0
         });
+        if !prompt_tokens.is_empty() {
+            params.set_tokens(&prompt_tokens);
+        }
 
         // Configure for good quality
         // If language is "auto" or None, use automatic language detection (pass None)
@@ -1278,6 +1332,35 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn prompt_batch_blocks_public_model_mutation_before_engine_access() {
+        let _test_boundary = crate::control::recording::TEST_BOUNDARY.lock().await;
+        let _batch = crate::control::recording::reserve_batch().unwrap();
+        let whisper = crate::whisper_engine::commands::whisper_delete_corrupted_model("tiny".into()).await.unwrap_err();
+        let parakeet = crate::parakeet_engine::commands::parakeet_delete_corrupted_model("parakeet".into()).await.unwrap_err();
+        assert!(whisper.contains("while recording or processing audio"), "{whisper}");
+        assert!(parakeet.contains("while recording or processing audio"), "{parakeet}");
+        let whisper_ready = crate::whisper_engine::commands::whisper_validate_model_ready().await.unwrap_err();
+        let parakeet_ready = crate::parakeet_engine::commands::parakeet_validate_model_ready().await.unwrap_err();
+        assert!(whisper_ready.contains("while recording or processing audio"), "{whisper_ready}");
+        assert!(parakeet_ready.contains("while recording or processing audio"), "{parakeet_ready}");
+
+    }
+
+    #[tokio::test]
+    async fn legacy_and_prompt_transcription_preserve_missing_model_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = WhisperEngine::new_with_models_dir(Some(directory.path().to_owned())).unwrap();
+        let old_plain = engine.transcribe_audio(vec![0.0; 1600], Some("ru".into())).await.unwrap_err();
+        let new_plain = engine.transcribe_audio_with_prompt(vec![0.0; 1600], Some("ru".into()), Some("КриптоПро")).await.unwrap_err();
+        let old_confidence = engine.transcribe_audio_with_confidence(vec![0.0; 1600], Some("ru".into())).await.unwrap_err();
+        let new_confidence = engine.transcribe_audio_with_confidence_and_prompt(vec![0.0; 1600], Some("ru".into()), Some("КриптоПро")).await.unwrap_err();
+        assert_eq!(old_plain.to_string(), "No model loaded. Please load a model first.");
+        assert_eq!(new_plain.to_string(), old_plain.to_string());
+        assert_eq!(old_confidence.to_string(), old_plain.to_string());
+        assert_eq!(new_confidence.to_string(), old_plain.to_string());
+    }
 
     fn tiny_model(models: &[ModelInfo]) -> &ModelInfo {
         models

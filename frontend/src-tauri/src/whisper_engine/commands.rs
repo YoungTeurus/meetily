@@ -128,6 +128,13 @@ pub async fn whisper_load_model(
     app_handle: tauri::AppHandle,
     model_name: String
 ) -> Result<(), String> {
+    // Public settings commands share the offline/live boundary. Internal engine
+    // methods remain unguarded because capture and batch jobs already own it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
@@ -232,6 +239,13 @@ pub async fn whisper_has_available_models() -> Result<bool, String> {
 
 #[command]
 pub async fn whisper_validate_model_ready() -> Result<String, String> {
+    // Validation may auto-load a model, so the public command must own the
+    // same mutation boundary. Internal *_with_config helpers already have it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
@@ -510,6 +524,13 @@ pub async fn whisper_cancel_download(model_name: String) -> Result<CancelDownloa
 
 #[command]
 pub async fn whisper_delete_corrupted_model(model_name: String) -> Result<String, String> {
+    // Public settings commands share the offline/live boundary. Internal engine
+    // methods remain unguarded because capture and batch jobs already own it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
         guard.as_ref().cloned()

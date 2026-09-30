@@ -220,6 +220,7 @@ pub enum LLMProvider {
     OpenRouter,
     BuiltInAI,
     CustomOpenAI,
+    CodexCli { binary_path: Option<PathBuf> },
 }
 
 impl LLMProvider {
@@ -233,6 +234,7 @@ impl LLMProvider {
             "openrouter" => Ok(Self::OpenRouter),
             "builtin-ai" | "local-llama" | "localllama" => Ok(Self::BuiltInAI),
             "custom-openai" => Ok(Self::CustomOpenAI),
+            "codex-cli" => Ok(Self::CodexCli { binary_path: None }),
             _ => Err(format!("Unsupported LLM provider: {}", s)),
         }
     }
@@ -276,6 +278,11 @@ pub(crate) async fn generate_summary(
         if token.is_cancelled() {
             return Err("Summary generation was cancelled".to_string());
         }
+    }
+
+    if let LLMProvider::CodexCli { binary_path } = provider {
+        return super::codex_cli::generate(binary_path.as_deref(), model_name, system_prompt, user_prompt, cancellation_token)
+            .await.map(|content| LlmCompletion { content, reasoning_stripped: false });
     }
 
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)
@@ -344,7 +351,7 @@ pub(crate) async fn generate_summary(
             );
             ("https://api.anthropic.com/v1/messages".to_string(), header_map)
         }
-        LLMProvider::BuiltInAI => {
+        LLMProvider::BuiltInAI | LLMProvider::CodexCli { .. } => {
             // This case is handled earlier with early returns
             unreachable!("BuiltInAI is handled before this match statement")
         }
@@ -922,6 +929,7 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+        LLMProvider::CodexCli { .. } => "Codex CLI",
     }
 }
 

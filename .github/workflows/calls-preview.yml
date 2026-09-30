@@ -1,0 +1,105 @@
+name: Meetily Calls Preview native builds
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'llama-helper/**'
+      - 'local-control/**'
+      - 'call-detection/**'
+      - 'meetilyctl/**'
+      - 'vendor/cpal/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-calls-preview.cjs'
+      - 'scripts/diagnose-windows-native.ps1'
+      - '.github/workflows/calls-preview.yml'
+      - '.github/*portable*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: calls-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.name }} — tests, desktop installer and CLI
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - name: Windows x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: calls-preview-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          pnpm --version
+          cmake --version
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Frontend tests and types
+        working-directory: frontend
+        run: |
+          bun test
+          pnpm exec tsc --noEmit
+      - name: Native tests, desktop package and standalone CLI
+        run: node scripts/build-calls-preview.cjs
+      - name: Diagnose Windows native loader failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/diagnose-windows-native.ps1
+      - name: Upload Windows native loader diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/windows-native-diagnostics/
+      - name: Upload preview installers and CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-calls-preview-${{ matrix.target }}-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            artifacts/calls-preview-${{ matrix.target }}/
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/msi/*.msi

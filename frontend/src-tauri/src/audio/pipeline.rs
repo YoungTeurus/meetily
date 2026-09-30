@@ -153,6 +153,16 @@ impl AudioMixerRingBuffer {
         Some((mic_window, sys_window))
     }
 
+    /// Drain the last fraction of a mixing window instead of leaving it behind.
+    fn drain_tail(&mut self) -> Option<(Vec<f32>,Vec<f32>)> {
+        let len=self.mic_buffer.len().max(self.system_buffer.len());
+        if len==0 {return None;}
+        let mut mic:Vec<_>=self.mic_buffer.drain(..).collect();
+        let mut system:Vec<_>=self.system_buffer.drain(..).collect();
+        mic.resize(len,0.0);system.resize(len,0.0);
+        Some((mic,system))
+    }
+
 }
 
 /// Simple audio mixer without aggressive ducking
@@ -925,10 +935,20 @@ impl AudioPipeline {
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
-        // Flush any remaining audio from VAD processor and send segments to transcription
+        // Preserve the final sub-window of mixed audio before flushing VAD.
+        let mut tail_segments=Vec::new();
+        if let Some((mic,system))=self.ring_buffer.drain_tail() {
+            let mixed=self.mixer.mix_window(&mic,&system);
+            tail_segments=self.vad_processor.process_audio(&mixed)?;
+            if let Some(sender)=&self.recording_sender_for_mixed {
+                sender.send(AudioChunk {data:mixed,sample_rate:self.sample_rate,timestamp:0.0,chunk_id:self.chunk_id_counter,device_type:DeviceType::Microphone})
+                    .map_err(|e|anyhow::anyhow!("Final recording chunk could not be queued: {e}"))?;
+            }
+        }
         match self.vad_processor.flush() {
             Ok(final_segments) => {
-                for segment in final_segments {
+                tail_segments.extend(final_segments);
+                for segment in tail_segments {
                     let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
                     // Send segments >= 50ms (800 samples at 16kHz) - matches main pipeline filter
@@ -945,7 +965,7 @@ impl AudioPipeline {
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                            warn!("Failed to send final VAD segment: {}", e);
+                            return Err(anyhow::anyhow!("Failed to send final VAD segment: {e}"));
                         } else {
                             self.chunk_id_counter += 1;
                         }
@@ -956,7 +976,7 @@ impl AudioPipeline {
                 }
             }
             Err(e) => {
-                warn!("Failed to flush VAD processor: {}", e);
+                return Err(anyhow::anyhow!("Failed to flush VAD processor: {e}"));
             }
         }
 
@@ -1041,7 +1061,7 @@ impl AudioPipelineManager {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Pipeline task failed: {}", e);
-                    Ok(())
+                    Err(anyhow::anyhow!("Audio pipeline task failed: {e}"))
                 }
             }
         } else {
@@ -1105,6 +1125,16 @@ impl Default for AudioPipelineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_drains_both_sources_shorter_than_one_mixing_window() {
+        let mut buffer=AudioMixerRingBuffer::new(48000);
+        buffer.mic_buffer.extend([0.1,0.2,0.3]);
+        buffer.system_buffer.extend([0.4]);
+        assert!(!buffer.can_mix());
+        assert_eq!(buffer.drain_tail(),Some((vec![0.1,0.2,0.3],vec![0.4,0.0,0.0])));
+        assert!(buffer.drain_tail().is_none());
+    }
 
     #[test]
     fn test_live_vad_redemption_matches_pro_policy() {

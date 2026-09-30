@@ -21,7 +21,22 @@ fn main() {
     ffmpeg::ensure_ffmpeg_binary();
     onnxruntime::ensure_onnxruntime_runtime();
 
-    tauri_build::build()
+    tauri_build::build();
+
+    // tauri-winres/embed-resource links this resource only into binary targets.
+    // The library test executable also retains Tauri/muda window code and needs
+    // the Common Controls v6 manifest to resolve TaskDialogIndirect on Windows.
+    // Expose its directory to the cfg(test) link declaration in lib.rs. Do not
+    // emit a generic link argument: binaries already receive this resource from
+    // Tauri, and passing it twice produces CVT1100 duplicate VERSION resources.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        let resource = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
+            .join("resource.lib");
+        assert!(resource.is_file(), "Tauri Windows resource was not generated");
+        println!("cargo:rustc-link-search=native={}", resource.parent().unwrap().display());
+    }
 }
 
 /// Detects GPU acceleration capabilities and provides build guidance

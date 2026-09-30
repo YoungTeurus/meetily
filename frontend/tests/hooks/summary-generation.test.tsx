@@ -48,6 +48,7 @@ const response = (overrides: Partial<SummaryProcessResponse> = {}): SummaryProce
   data: null, error: null, meetingName: 'Meeting A', ...overrides,
 });
 let configuredModel = 'test';
+let configuredProvider: 'ollama' | 'codex-cli' = 'ollama';
 let state: ReturnType<typeof useSummaryGeneration>;
 function Status({ initialSummary, meetingId = 'meeting-a' }: {
   initialSummary: SummaryProcessResponse; meetingId?: string;
@@ -56,7 +57,7 @@ function Status({ initialSummary, meetingId = 'meeting-a' }: {
   const [title, updateMeetingTitle] = useState('Original title');
   state = useSummaryGeneration({
     meeting: { id: meetingId, created_at: '2026-09-01T00:00:00Z' },
-    transcripts: [], modelConfig: { provider: 'ollama', model: configuredModel, whisperModel: 'base' },
+    transcripts: [], modelConfig: { provider: configuredProvider, model: configuredModel, whisperModel: 'base' },
     isModelConfigLoading: false, selectedTemplate: 'daily_standup',
     setAiSummary, updateMeetingTitle, initialSummary,
   });
@@ -71,6 +72,7 @@ const realClearInterval = globalThis.clearInterval;
 beforeEach(() => {
   renderer = undefined as unknown as ReactTestRenderer;
   configuredModel = 'test';
+  configuredProvider = 'ollama';
   timers.clear(); notify.mockClear(); trackCompletion.mockClear(); invoke.mockClear();
   getSummary = async () => response();
   startProcess = async () => ({ process_id: 'attempt-a' });
@@ -270,4 +272,43 @@ describe('summary state restored when returning to a meeting', () => {
     expect(state.summaryStatus).toBe('completed');
     expect(text()).toContain('Finished summary');
   });
+});
+
+ test('Codex CLI default model generates without API key, model download or Ollama preflight', async () => {
+  configuredProvider = 'codex-cli'; configuredModel = '';
+  await show(response({ status: 'completed' }));
+  await act(async () => { await state.handleGenerateSummary(); });
+  expect(invoke.mock.calls.some(([command]) => command === 'api_process_transcript')).toBe(true);
+  expect(invoke.mock.calls.some(([command]) => command === 'get_ollama_models' || command === 'builtin_ai_is_model_ready' || command === 'api_get_api_key')).toBe(false);
+});
+
+test('Generate summary waits for the latest meeting notes to save', async () => {
+  const { meetingNotesService } = await import('../../src/services/meetingNotesService');
+  const originalFlush = meetingNotesService.flush;
+  let finishSave!: () => void;
+  const saved = new Promise<void>(resolve => { finishSave = resolve; });
+  const flushed: string[] = [];
+  meetingNotesService.flush = async id => { flushed.push(id); await saved; };
+  try {
+    await show(response({ status: 'idle', start: null }));
+    let generation!: Promise<void>;
+    await act(async () => { generation = state.handleGenerateSummary(); });
+    expect(flushed).toEqual(['meeting-a']);
+    expect(invoke.mock.calls.some(([command]) => command === 'api_process_transcript')).toBe(false);
+    await act(async () => { finishSave(); await generation; });
+    expect(invoke.mock.calls.some(([command]) => command === 'api_process_transcript')).toBe(true);
+  } finally { meetingNotesService.flush = originalFlush; }
+});
+
+test('notes save failure blocks summary generation and remains visible', async () => {
+  const { meetingNotesService } = await import('../../src/services/meetingNotesService');
+  const originalFlush = meetingNotesService.flush;
+  meetingNotesService.flush = async () => { throw new Error('Notes conflict: resolve your retained draft'); };
+  try {
+    await show(response({ status: 'idle', start: null }));
+    await act(async () => state.handleGenerateSummary());
+    expect(invoke.mock.calls.some(([command]) => command === 'api_process_transcript')).toBe(false);
+    expect(state.summaryError).toContain('Notes conflict');
+    expect(state.summaryStatus).toBe('error');
+  } finally { meetingNotesService.flush = originalFlush; }
 });

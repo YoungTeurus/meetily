@@ -29,13 +29,15 @@ import {
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
+import { CodexCliSettings } from './CodexCliSettings';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai' | 'codex-cli';
   model: string;
   whisperModel: string;
   apiKey?: string | null;
   ollamaEndpoint?: string | null;
+  codexBinaryPath?: string | null;
   // Custom OpenAI fields
   customOpenAIEndpoint?: string | null;
   customOpenAIModel?: string | null;
@@ -230,6 +232,7 @@ export function ModelSettingsModal({
     openai: openaiModels.length > 0 ? openaiModels : OPENAI_FALLBACK_MODELS,
     openrouter: openRouterModels.map((m) => m.id),
     'builtin-ai': builtinAiModels.map((m) => m.name),
+    'codex-cli': [],
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
   };
 
@@ -268,7 +271,7 @@ export function ModelSettingsModal({
           setModelConfig(data);
 
           // Fetch API key if not included in response and provider requires it
-          if (data.provider !== 'ollama' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'codex-cli' && !data.apiKey) {
             try {
               const apiKeyData = await invoke('api_get_api_key', {
                 provider: data.provider
@@ -636,7 +639,8 @@ export function ModelSettingsModal({
 
     const updatedConfig = {
       ...modelConfig,
-      apiKey: typeof apiKey === 'string' ? apiKey.trim() || null : null,
+      apiKey: requiresApiKey && typeof apiKey === 'string' ? apiKey.trim() || null : null,
+      codexBinaryPath: modelConfig.codexBinaryPath?.trim() ?? '',
       ollamaEndpoint: modelConfig.provider === 'ollama'
         ? (ollamaEndpoint.trim() || null)
         : (modelConfig.ollamaEndpoint || null),
@@ -832,7 +836,7 @@ export function ModelSettingsModal({
                 const defaultModel = providerModels && providerModels.length > 0
                   ? providerModels[0]
                   : '';
-                const model = (savedModel && providerModels?.includes(savedModel))
+                const model = (savedModel && (provider === 'codex-cli' || providerModels?.includes(savedModel)))
                   ? savedModel
                   : defaultModel;
 
@@ -876,6 +880,7 @@ export function ModelSettingsModal({
               <SelectContent className="max-h-64 overflow-y-auto">
                 <SelectItem value="builtin-ai">Built-in AI (Offline, No API needed)</SelectItem>
                 <SelectItem value="claude">Claude</SelectItem>
+                <SelectItem value="codex-cli">Codex CLI (existing login)</SelectItem>
                 <SelectItem value="custom-openai">Custom Server (OpenAI)</SelectItem>
                 <SelectItem value="groq">Groq</SelectItem>
                 <SelectItem value="ollama">Ollama</SelectItem>
@@ -884,7 +889,7 @@ export function ModelSettingsModal({
               </SelectContent>
             </Select>
 
-            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && (
+            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && modelConfig.provider !== 'codex-cli' && (
               <Popover open={modelComboboxOpen} onOpenChange={setModelComboboxOpen} modal={true}>
                 <PopoverTrigger asChild>
                   <Button
@@ -943,6 +948,8 @@ export function ModelSettingsModal({
             )}
           </div>
         </div>
+
+        {modelConfig.provider === 'codex-cli' && <CodexCliSettings modelConfig={modelConfig} setModelConfig={setModelConfig} />}
 
         {/* Custom OpenAI Configuration Section */}
         {modelConfig.provider === 'custom-openai' && (

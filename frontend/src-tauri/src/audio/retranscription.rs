@@ -1,10 +1,12 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
-use crate::audio::decoder::decode_audio_file;
-use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
-use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use super::retranscription_store;
+use crate::audio::decoder::decode_audio_file;
+use crate::audio::vad::get_speech_chunks_with_progress;
+use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
+use crate::database::repositories::vocabulary::VocabularyRepository;
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -13,7 +15,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Global flag to track if retranscription is in progress
@@ -21,6 +23,38 @@ static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
+static JOB: Mutex<Option<RetranscriptionJob>> = Mutex::new(None);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RetranscriptionJob {
+    pub automatic: bool,
+    pub job_id: String,
+    pub meeting_id: String,
+    pub state: String,
+    pub stage: String,
+    pub progress_percentage: u32,
+    pub message: String,
+    pub error: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub language: Option<String>,
+    pub vocabulary_terms: Option<String>,
+    pub effective_vocabulary: Option<String>,
+    pub result: Option<RetranscriptionResult>,
+}
+fn current_job_id() -> String {
+    JOB.lock()
+        .unwrap()
+        .as_ref()
+        .map(|j| j.job_id.clone())
+        .unwrap_or_default()
+}
+fn begin_commit() -> Result<()> {
+    let mut job = JOB.lock().unwrap();
+    job.as_mut()
+        .ok_or_else(|| anyhow!("Retranscription job missing"))?
+        .reserve_commit(&RETRANSCRIPTION_CANCELLED)
+}
 
 /// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
 /// Ensures flag is cleared even if retranscription panics or returns early
@@ -45,6 +79,29 @@ impl Drop for RetranscriptionGuard {
     }
 }
 
+impl RetranscriptionJob {
+    fn request_cancel(&self, job_id: &str, flag: &AtomicBool) -> Result<(), String> {
+        if self.job_id != job_id {
+            return Err("This retranscription job is no longer active".into());
+        }
+        if self.state != "running" {
+            return Err("This retranscription job has finished".into());
+        }
+        if matches!(self.stage.as_str(), "saving" | "complete") {
+            return Err("Transcript replacement is already committing".into());
+        }
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn reserve_commit(&mut self, flag: &AtomicBool) -> Result<()> {
+        if flag.load(Ordering::SeqCst) {
+            return Err(anyhow!("Retranscription cancelled"));
+        }
+        self.stage = "saving".into();
+        Ok(())
+    }
+}
+
 /// VAD redemption time in milliseconds - bridges natural pauses in speech
 /// Batch processing needs longer redemption (2000ms) than the live pipeline
 /// (500ms) because the entire file is processed at once by VAD with no
@@ -55,6 +112,7 @@ const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 /// Progress update emitted during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetranscriptionProgress {
+    pub job_id: String,
     pub meeting_id: String,
     pub stage: String, // "decoding", "transcribing", "saving"
     pub progress_percentage: u32,
@@ -64,6 +122,10 @@ pub struct RetranscriptionProgress {
 /// Result of retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetranscriptionResult {
+    pub job_id: String,
+    pub transcript_revision: i64,
+    pub summary_stale: bool,
+    pub warnings: Vec<String>,
     pub meeting_id: String,
     pub segments_count: usize,
     pub duration_seconds: f64,
@@ -73,6 +135,8 @@ pub struct RetranscriptionResult {
 /// Error during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetranscriptionError {
+    pub job_id: String,
+    pub cancelled: bool,
     pub meeting_id: String,
     pub error: String,
 }
@@ -88,22 +152,31 @@ pub fn cancel_retranscription() {
 }
 
 /// Start retranscription of a meeting's audio
-pub async fn start_retranscription<R: Runtime>(
+async fn start_retranscription<R: Runtime>(
+    _guard: RetranscriptionGuard,
     app: AppHandle<R>,
     meeting_id: String,
     meeting_folder_path: String,
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    initial_prompt: Option<String>,
+    recording_started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<RetranscriptionResult> {
-    // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
-
-    // Reset cancellation flag
-    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
-
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let engine_guard = super::common::acquire_engine_lifecycle_lock().await;
+    let result = run_retranscription(
+        app.clone(),
+        meeting_id.clone(),
+        meeting_folder_path,
+        language,
+        model,
+        provider,
+        initial_prompt,
+        recording_started_at,
+    )
+    .await;
+    drop(engine_guard);
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -111,11 +184,28 @@ pub async fn start_retranscription<R: Runtime>(
     // Guard will automatically clear flag on drop
     // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
 
+    {
+        let mut job = JOB.lock().unwrap();
+        if let Some(job) = job.as_mut() {
+            job.state = match &result {
+                Ok(_) => "completed",
+                Err(_) if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) => "cancelled",
+                Err(_) => "failed",
+            }
+            .into();
+            job.error = result.as_ref().err().map(ToString::to_string);
+            job.result = result.as_ref().ok().cloned();
+        }
+    }
     match &result {
         Ok(res) => {
             let _ = app.emit(
                 "retranscription-complete",
                 serde_json::json!({
+                    "job_id": res.job_id,
+                    "transcript_revision": res.transcript_revision,
+                    "summary_stale": res.summary_stale,
+                    "warnings": res.warnings,
                     "meeting_id": res.meeting_id,
                     "segments_count": res.segments_count,
                     "duration_seconds": res.duration_seconds,
@@ -127,6 +217,8 @@ pub async fn start_retranscription<R: Runtime>(
             let _ = app.emit(
                 "retranscription-error",
                 RetranscriptionError {
+                    job_id: current_job_id(),
+                    cancelled: RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
                     meeting_id: meeting_id.clone(),
                     error: e.to_string(),
                 },
@@ -141,14 +233,31 @@ pub async fn start_retranscription<R: Runtime>(
 /// Tries common names first, then scans for any file with an audio extension
 fn find_audio_file(folder: &Path) -> Result<PathBuf> {
     let candidates = [
-        "audio.mp4", "audio.m4a", "audio.wav", "audio.mp3",
-        "audio.flac", "audio.ogg", "recording.mp4",
-        "audio.mkv", "audio.webm", "audio.wma",
+        "audio.mp4",
+        "audio.m4a",
+        "audio.wav",
+        "audio.mp3",
+        "audio.flac",
+        "audio.ogg",
+        "recording.mp4",
+        "audio.mkv",
+        "audio.webm",
+        "audio.wma",
     ];
 
+    let canonical_folder = folder
+        .canonicalize()
+        .map_err(|_| anyhow!("Saved audio folder does not exist"))?;
+    let valid = |path: &Path| {
+        path.is_file()
+            && path
+                .canonicalize()
+                .map(|p| p.starts_with(&canonical_folder))
+                .unwrap_or(false)
+    };
     for name in candidates {
         let path = folder.join(name);
-        if path.exists() {
+        if valid(&path) {
             return Ok(path);
         }
     }
@@ -159,7 +268,7 @@ fn find_audio_file(folder: &Path) -> Result<PathBuf> {
             let path = entry.path();
             if let Some(ext) = path.extension() {
                 let ext = ext.to_string_lossy().to_lowercase();
-                if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+                if AUDIO_EXTENSIONS.contains(&ext.as_str()) && valid(&path) {
                     return Ok(path);
                 }
             }
@@ -177,6 +286,8 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    initial_prompt: Option<String>,
+    recording_started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
@@ -199,11 +310,9 @@ async fn run_retranscription<R: Runtime>(
 
     // Decode the audio file (CPU-intensive, run in blocking task)
     let path_for_decode = audio_path.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        decode_audio_file(&path_for_decode)
-    })
-    .await
-    .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
+    let decoded = tokio::task::spawn_blocking(move || decode_audio_file(&path_for_decode))
+        .await
+        .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
     let duration_seconds = decoded.duration_seconds;
 
     info!(
@@ -211,7 +320,13 @@ async fn run_retranscription<R: Runtime>(
         duration_seconds, decoded.sample_rate, decoded.channels
     );
 
-    emit_progress(&app, &meeting_id, "decoding", 15, "Converting audio format...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "decoding",
+        15,
+        "Converting audio format...",
+    );
 
     // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
@@ -219,12 +334,13 @@ async fn run_retranscription<R: Runtime>(
     }
 
     // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format()
-    })
-    .await
-    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
-    info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
+    let audio_samples = tokio::task::spawn_blocking(move || decoded.to_whisper_format())
+        .await
+        .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+    info!(
+        "Converted to 16kHz mono format: {} samples",
+        audio_samples.len()
+    );
 
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
@@ -251,7 +367,10 @@ async fn run_retranscription<R: Runtime>(
                     &meeting_id_for_vad,
                     "vad",
                     overall_progress,
-                    &format!("Detecting speech segments... {}% ({} found)", vad_progress, segments_found),
+                    &format!(
+                        "Detecting speech segments... {}% ({} found)",
+                        vad_progress, segments_found
+                    ),
                 );
 
                 // Return false to cancel if cancellation requested
@@ -264,17 +383,24 @@ async fn run_retranscription<R: Runtime>(
     .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
 
     let total_segments = speech_segments.len();
-    info!("VAD detected {} speech segments (redemption_time={}ms)", total_segments, VAD_REDEMPTION_TIME_MS);
+    info!(
+        "VAD detected {} speech segments (redemption_time={}ms)",
+        total_segments, VAD_REDEMPTION_TIME_MS
+    );
 
     // Diagnostic: log segment duration distribution
     if !speech_segments.is_empty() {
-        let durations_ms: Vec<f64> = speech_segments.iter()
+        let durations_ms: Vec<f64> = speech_segments
+            .iter()
             .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
             .collect();
         let total_speech_ms: f64 = durations_ms.iter().sum();
         let avg_duration = total_speech_ms / durations_ms.len() as f64;
         let min_duration = durations_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_duration = durations_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_duration = durations_ms
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         info!(
             "VAD segment stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
             avg_duration, min_duration, max_duration,
@@ -284,8 +410,14 @@ async fn run_retranscription<R: Runtime>(
         // Log first 10 segments for detailed inspection
         for (i, seg) in speech_segments.iter().take(10).enumerate() {
             let dur = seg.end_timestamp_ms - seg.start_timestamp_ms;
-            debug!("  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples)",
-                i, seg.start_timestamp_ms, seg.end_timestamp_ms, dur, seg.samples.len());
+            debug!(
+                "  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples)",
+                i,
+                seg.start_timestamp_ms,
+                seg.end_timestamp_ms,
+                dur,
+                seg.samples.len()
+            );
         }
         if total_segments > 10 {
             debug!("  ... and {} more segments", total_segments - 10);
@@ -297,7 +429,13 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    emit_progress(&app, &meeting_id, "transcribing", 25, "Loading transcription engine...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "transcribing",
+        25,
+        "Loading transcription engine...",
+    );
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -334,7 +472,10 @@ async fn run_retranscription<R: Runtime>(
     }
 
     let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+    info!(
+        "Processing {} segments (after splitting)",
+        processable_count
+    );
 
     // Process each speech segment with progress updates
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
@@ -364,7 +505,11 @@ async fn run_retranscription<R: Runtime>(
 
         // Skip very short segments (< 100ms of audio = 1600 samples at 16kHz)
         if segment.samples.len() < 1600 {
-            debug!("Skipping short segment {} with {} samples", i, segment.samples.len());
+            debug!(
+                "Skipping short segment {} with {} samples",
+                i,
+                segment.samples.len()
+            );
             continue;
         }
 
@@ -379,7 +524,11 @@ async fn run_retranscription<R: Runtime>(
         } else {
             let engine = whisper_engine.as_ref().unwrap();
             let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+                .transcribe_audio_with_confidence_and_prompt(
+                    segment.samples.clone(),
+                    language.clone(),
+                    initial_prompt.as_deref(),
+                )
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             (text, conf)
@@ -390,13 +539,29 @@ async fn run_retranscription<R: Runtime>(
         if !trimmed.is_empty() {
             debug!(
                 "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
-                i + 1, processable_count, segment_duration_sec, conf,
-                if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
+                i + 1,
+                processable_count,
+                segment_duration_sec,
+                conf,
+                if trimmed.len() > 80 {
+                    let mut end = 80;
+                    while !trimmed.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &trimmed[..end]
+                } else {
+                    trimmed
+                }
             );
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
         } else {
-            debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
+            debug!(
+                "Segment {}/{}: {:.1}s — empty transcription",
+                i + 1,
+                processable_count,
+                segment_duration_sec
+            );
         }
     }
 
@@ -417,60 +582,63 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
+    // Cancellation is acknowledged only before this commit boundary.
+    begin_commit()?;
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
-
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
-
-    // Save to database
+    let mut segments = create_transcript_segments(&all_transcripts);
+    for segment in &mut segments {
+        let start = segment.audio_start_time.unwrap_or(0.0);
+        segment.timestamp = (recording_started_at
+            + chrono::Duration::milliseconds((start * 1000.0).round() as i64))
+        .to_rfc3339();
+    }
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
-
-    // Wrap delete+insert+update in a transaction to prevent data loss
-    let pool = app_state.db_manager.pool();
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
-    let mut tx = sqlx::Connection::begin(&mut *conn)
-        .await
-        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
-
-    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
-
-    for segment in &segments {
-        sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+    let replacement: Vec<_> = segments
+        .iter()
+        .map(|s| retranscription_store::ReplacementSegment {
+            id: s.id.clone(),
+            text: s.text.clone(),
+            timestamp: s.timestamp.clone(),
+            audio_start_time: s.audio_start_time,
+            audio_end_time: s.audio_end_time,
+            duration: s.duration,
+        })
+        .collect();
+    let metadata = {
+        let _summary_guard = crate::summary::commands::SUMMARY_START_LOCK.lock().await;
+        let automatic_id = JOB
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|j| j.automatic)
+            .map(|j| j.job_id.clone());
+        retranscription_store::replace_for_job(
+            app_state.db_manager.pool(),
+            &meeting_id,
+            &replacement,
+            automatic_id.as_deref(),
         )
-        .bind(&segment.id)
-        .bind(&meeting_id)
-        .bind(&segment.text)
-        .bind(&segment.timestamp)
-        .bind(segment.audio_start_time)
-        .bind(segment.audio_end_time)
-        .bind(segment.duration)
-        .execute(&mut *tx)
         .await
-        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
-    }
-
-    tx.commit().await
-        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
-
-    info!(
-        "Updated {} transcripts for meeting {} in transaction",
-        segments.len(),
-        meeting_id
-    );
+        .map_err(|e| anyhow!(e))?
+    };
+    let mut warnings = Vec::new();
 
     // Write updated transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "saving",
+        90,
+        "Writing transcript files...",
+    );
 
     if let Err(e) = write_transcripts_json(&folder_path, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
+        warnings.push(format!(
+            "Transcript saved in the database, but its file copy could not be updated: {e}"
+        ));
     }
 
     // Find audio filename for metadata
@@ -480,18 +648,28 @@ async fn run_retranscription<R: Runtime>(
         .unwrap_or("audio.mp4")
         .to_string();
 
-    if let Err(e) = write_retranscription_metadata(
-        &folder_path,
-        &meeting_id,
-        duration_seconds,
-        &audio_filename,
-    ) {
+    if let Err(e) =
+        write_retranscription_metadata(&folder_path, &meeting_id, duration_seconds, &audio_filename)
+    {
         warn!("Failed to update metadata.json: {}", e);
+        warnings.push(format!(
+            "Transcript saved in the database, but audio metadata could not be updated: {e}"
+        ));
     }
 
-    emit_progress(&app, &meeting_id, "complete", 100, "Retranscription complete");
+    emit_progress(
+        &app,
+        &meeting_id,
+        "complete",
+        100,
+        "Retranscription complete",
+    );
 
     Ok(RetranscriptionResult {
+        job_id: current_job_id(),
+        transcript_revision: metadata.transcript_revision,
+        summary_stale: metadata.summary_stale,
+        warnings,
         meeting_id,
         segments_count: segments.len(),
         duration_seconds,
@@ -507,9 +685,21 @@ fn emit_progress<R: Runtime>(
     progress: u32,
     message: &str,
 ) {
+    let job_id = {
+        let mut job = JOB.lock().unwrap();
+        if let Some(job) = job.as_mut() {
+            job.stage = stage.into();
+            job.progress_percentage = progress;
+            job.message = message.into();
+            job.job_id.clone()
+        } else {
+            String::new()
+        }
+    };
     let _ = app.emit(
         "retranscription-progress",
         RetranscriptionProgress {
+            job_id,
             meeting_id: meeting_id.to_string(),
             stage: stage.to_string(),
             progress_percentage: progress,
@@ -525,6 +715,10 @@ async fn get_or_init_whisper<R: Runtime>(
     requested_model: Option<&str>,
 ) -> Result<Arc<WhisperEngine>> {
     use crate::whisper_engine::commands::WHISPER_ENGINE;
+    // A recovered automatic queue can run before the background startup initializer.
+    crate::whisper_engine::commands::whisper_init()
+        .await
+        .map_err(|e| anyhow!(e))?;
 
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -555,7 +749,10 @@ async fn get_or_init_whisper<R: Runtime>(
                 // Discover available models first (populates the internal cache)
                 info!("Discovering available Whisper models...");
                 if let Err(discover_err) = e.discover_models().await {
-                    warn!("Error during model discovery (continuing anyway): {}", discover_err);
+                    warn!(
+                        "Error during model discovery (continuing anyway): {}",
+                        discover_err
+                    );
                 }
 
                 match e.load_model(&target_model).await {
@@ -564,8 +761,15 @@ async fn get_or_init_whisper<R: Runtime>(
                         Ok(e)
                     }
                     Err(load_err) => {
-                        error!("Failed to load Whisper model '{}': {}", target_model, load_err);
-                        Err(anyhow!("Failed to load Whisper model '{}': {}", target_model, load_err))
+                        error!(
+                            "Failed to load Whisper model '{}': {}",
+                            target_model, load_err
+                        );
+                        Err(anyhow!(
+                            "Failed to load Whisper model '{}': {}",
+                            target_model,
+                            load_err
+                        ))
                     }
                 }
             } else {
@@ -581,41 +785,47 @@ async fn get_or_init_whisper<R: Runtime>(
 async fn get_configured_whisper_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
     debug!("Getting configured Whisper model from database...");
 
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| {
-            error!("App state not available");
-            anyhow!("App state not available")
-        })?;
+    let app_state = app.try_state::<AppState>().ok_or_else(|| {
+        error!("App state not available");
+        anyhow!("App state not available")
+    })?;
 
     debug!("Querying transcript_settings table...");
 
     // Query the transcript settings from the database - get both provider and model
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'"
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| {
-        error!("Failed to query transcript config: {}", e);
-        anyhow!("Failed to query transcript config: {}", e)
-    })?;
+    let result: Option<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+            .fetch_optional(app_state.db_manager.pool())
+            .await
+            .map_err(|e| {
+                error!("Failed to query transcript config: {}", e);
+                anyhow!("Failed to query transcript config: {}", e)
+            })?;
 
     match result {
         Some((provider, model)) => {
-            info!("Found transcript config: provider={}, model={}", provider, model);
+            info!(
+                "Found transcript config: provider={}, model={}",
+                provider, model
+            );
 
             // Check if provider is Whisper-based
             if provider == "localWhisper" || provider == "whisper" {
                 Ok(model)
             } else {
-                error!("Retranscription requires Whisper provider, but configured provider is: {}", provider);
+                error!(
+                    "Retranscription requires Whisper provider, but configured provider is: {}",
+                    provider
+                );
                 Err(anyhow!("Retranscription requires Whisper. Current provider '{}' does not support retranscription with language selection.", provider))
             }
-        },
+        }
         None => {
             // Default to configured Whisper model if no config exists
-            warn!("No transcript config found, using default model '{}'", DEFAULT_WHISPER_MODEL);
+            warn!(
+                "No transcript config found, using default model '{}'",
+                DEFAULT_WHISPER_MODEL
+            );
             Ok(DEFAULT_WHISPER_MODEL.to_string())
         }
     }
@@ -627,6 +837,9 @@ async fn get_or_init_parakeet<R: Runtime>(
     requested_model: Option<&str>,
 ) -> Result<Arc<ParakeetEngine>> {
     use crate::parakeet_engine::commands::PARAKEET_ENGINE;
+    crate::parakeet_engine::commands::parakeet_init()
+        .await
+        .map_err(|e| anyhow!(e))?;
 
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -657,7 +870,10 @@ async fn get_or_init_parakeet<R: Runtime>(
                 // Discover available models first
                 info!("Discovering available Parakeet models...");
                 if let Err(discover_err) = e.discover_models().await {
-                    warn!("Error during Parakeet model discovery (continuing anyway): {}", discover_err);
+                    warn!(
+                        "Error during Parakeet model discovery (continuing anyway): {}",
+                        discover_err
+                    );
                 }
 
                 match e.load_model(&target_model).await {
@@ -666,8 +882,15 @@ async fn get_or_init_parakeet<R: Runtime>(
                         Ok(e)
                     }
                     Err(load_err) => {
-                        error!("Failed to load Parakeet model '{}': {}", target_model, load_err);
-                        Err(anyhow!("Failed to load Parakeet model '{}': {}", target_model, load_err))
+                        error!(
+                            "Failed to load Parakeet model '{}': {}",
+                            target_model, load_err
+                        );
+                        Err(anyhow!(
+                            "Failed to load Parakeet model '{}': {}",
+                            target_model,
+                            load_err
+                        ))
                     }
                 }
             } else {
@@ -683,27 +906,27 @@ async fn get_or_init_parakeet<R: Runtime>(
 async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
     debug!("Getting configured Parakeet model from database...");
 
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| {
-            error!("App state not available");
-            anyhow!("App state not available")
-        })?;
+    let app_state = app.try_state::<AppState>().ok_or_else(|| {
+        error!("App state not available");
+        anyhow!("App state not available")
+    })?;
 
     // Query the transcript settings from the database
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'"
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| {
-        error!("Failed to query transcript config: {}", e);
-        anyhow!("Failed to query transcript config: {}", e)
-    })?;
+    let result: Option<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM transcript_settings WHERE id = '1'")
+            .fetch_optional(app_state.db_manager.pool())
+            .await
+            .map_err(|e| {
+                error!("Failed to query transcript config: {}", e);
+                anyhow!("Failed to query transcript config: {}", e)
+            })?;
 
     match result {
         Some((provider, model)) => {
-            info!("Found transcript config: provider={}, model={}", provider, model);
+            info!(
+                "Found transcript config: provider={}, model={}",
+                provider, model
+            );
 
             if provider == "parakeet" {
                 Ok(model)
@@ -712,7 +935,7 @@ async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result
                 warn!("Configured provider is not Parakeet, using default model");
                 Ok(DEFAULT_PARAKEET_MODEL.to_string())
             }
-        },
+        }
         None => {
             // Default to configured Parakeet model if no config exists
             warn!("No transcript config found, using default Parakeet model");
@@ -737,10 +960,16 @@ fn write_retranscription_metadata(
         let existing = std::fs::read_to_string(&metadata_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&existing)?;
         if let Some(obj) = value.as_object_mut() {
-            obj.insert("duration_seconds".to_string(), serde_json::json!(duration_seconds));
+            obj.insert(
+                "duration_seconds".to_string(),
+                serde_json::json!(duration_seconds),
+            );
             obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
             obj.insert("status".to_string(), serde_json::json!("completed"));
-            obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
+            obj.insert(
+                "transcript_file".to_string(),
+                serde_json::json!("transcripts.json"),
+            );
             obj.remove("detected_summary_language");
         }
         value
@@ -769,74 +998,228 @@ fn write_retranscription_metadata(
 
 // Tauri commands
 
-/// Response when retranscription is started
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetranscriptionStarted {
     pub meeting_id: String,
+    pub job_id: String,
     pub message: String,
 }
 
-// Start retranscription (Beta gated using configContext.betaFeatures)
 #[tauri::command]
 pub async fn start_retranscription_command<R: Runtime>(
     app: AppHandle<R>,
     meeting_id: String,
-    meeting_folder_path: String,
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    vocabulary_terms: Option<String>,
+    confirm_replace: bool,
+    job_id: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
-
-    // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
-    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
-        return Err("Retranscription already in progress".to_string());
+    if !confirm_replace {
+        return Err("Confirm transcript replacement before continuing".into());
     }
-
-    // Clone values for the spawned task
-    let meeting_id_clone = meeting_id.clone();
-
-    // Spawn the retranscription in a background task
+    let provider = provider.unwrap_or_else(|| "whisper".into());
+    if !matches!(provider.as_str(), "parakeet" | "whisper" | "localWhisper") {
+        return Err("Choose an installed Whisper or Parakeet model".into());
+    }
+    let language = language.filter(|s| s != "auto");
+    if provider == "parakeet" && language.is_some() {
+        return Err("Parakeet supports automatic language only".into());
+    }
+    if language.as_deref().is_some_and(|l| {
+        l.contains('\0') || (l != "auto-translate" && whisper_rs::get_lang_id(l).is_none())
+    }) {
+        return Err("Unsupported language".into());
+    }
+    let run_hints =
+        VocabularyRepository::normalize(vocabulary_terms.as_deref().unwrap_or_default())?;
+    if provider == "parakeet" && run_hints.is_some() {
+        return Err("Vocabulary hints are only supported by Whisper".into());
+    }
+    let model = model
+        .filter(|s| !s.is_empty())
+        .ok_or("Choose an installed model")?;
+    let job_id = job_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    uuid::Uuid::parse_str(&job_id).map_err(|_| "Invalid job ID")?;
+    let batch_guard = crate::control::recording::reserve_batch()?;
+    let guard = RetranscriptionGuard::acquire()?;
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    let (folder, started_at) =
+        retranscription_store::source(state.db_manager.pool(), &meeting_id).await?;
+    find_audio_file(Path::new(&folder)).map_err(|e| e.to_string())?;
+    let global = if provider == "parakeet" {
+        None
+    } else {
+        VocabularyRepository::get_global(state.db_manager.pool())
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    super::automatic_retranscription_store::supersede(state.db_manager.pool(), &meeting_id).await?;
+    let initial_prompt = VocabularyRepository::merge(run_hints.as_deref(), global.as_deref());
+    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    *JOB.lock().unwrap() = Some(RetranscriptionJob {
+        automatic: false,
+        job_id: job_id.clone(),
+        meeting_id: meeting_id.clone(),
+        state: "running".into(),
+        stage: "queued".into(),
+        progress_percentage: 0,
+        message: "Preparing saved audio".into(),
+        error: None,
+        provider: provider.clone(),
+        model: model.clone(),
+        language: language.clone(),
+        vocabulary_terms: run_hints,
+        effective_vocabulary: initial_prompt.clone(),
+        result: None,
+    });
+    let id = meeting_id.clone();
     tauri::async_runtime::spawn(async move {
+        let _batch_guard = batch_guard;
         let result = start_retranscription(
+            guard,
             app,
-            meeting_id_clone,
-            meeting_folder_path,
+            id,
+            folder,
             language,
-            model,
-            provider,
+            Some(model),
+            Some(provider),
+            initial_prompt,
+            started_at,
         )
         .await;
-
-        // Errors are already emitted as events in start_retranscription
-        // so we just log here for debugging
         if let Err(e) = result {
             error!("Retranscription failed: {}", e);
         }
     });
-
     Ok(RetranscriptionStarted {
         meeting_id,
-        message: "Retranscription started".to_string(),
+        job_id,
+        message: "Retranscription started".into(),
     })
 }
 
 #[tauri::command]
-pub async fn cancel_retranscription_command() -> Result<(), String> {
-    if !is_retranscription_in_progress() {
-        return Err("No retranscription in progress".to_string());
+pub async fn cancel_retranscription_command(job_id: String) -> Result<(), String> {
+    let job = JOB.lock().unwrap();
+    let job = job.as_ref().ok_or("No retranscription in progress")?;
+    job.request_cancel(&job_id, &RETRANSCRIPTION_CANCELLED)?;
+    if job.automatic {
+        super::automatic_retranscription::mark_user_cancelled();
     }
-    cancel_retranscription();
     Ok(())
 }
-
+#[tauri::command]
+pub async fn get_retranscription_status_command(meeting_id: Option<String>) -> serde_json::Value {
+    let job = JOB.lock().unwrap();
+    serde_json::json!({"job":job.as_ref().filter(|j|meeting_id.as_ref().map_or(true,|m|m==&j.meeting_id))})
+}
 #[tauri::command]
 pub async fn is_retranscription_in_progress_command() -> bool {
     is_retranscription_in_progress()
+}
+#[tauri::command]
+pub async fn get_whisper_vocabulary<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    let global = VocabularyRepository::get_global(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(
+        serde_json::json!({"global":global,"max_chars":crate::database::repositories::vocabulary::MAX_VOCABULARY_CHARS}),
+    )
+}
+#[tauri::command]
+pub async fn save_global_whisper_vocabulary<R: Runtime>(
+    app: AppHandle<R>,
+    vocabulary: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    let global =
+        VocabularyRepository::save_global(state.db_manager.pool(), vocabulary.as_deref()).await?;
+    Ok(
+        serde_json::json!({"global":global,"max_chars":crate::database::repositories::vocabulary::MAX_VOCABULARY_CHARS}),
+    )
+}
+#[tauri::command]
+pub async fn get_meeting_transcription_info<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+) -> Result<retranscription_store::TranscriptionInfo, String> {
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    retranscription_store::info(state.db_manager.pool(), &meeting_id).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_job() -> RetranscriptionJob {
+        RetranscriptionJob {
+            automatic: false,
+            job_id: "current".into(),
+            meeting_id: "m".into(),
+            state: "running".into(),
+            stage: "transcribing".into(),
+            progress_percentage: 25,
+            message: String::new(),
+            error: None,
+            provider: "whisper".into(),
+            model: "small".into(),
+            language: None,
+            vocabulary_terms: None,
+            effective_vocabulary: None,
+            result: None,
+        }
+    }
+    #[test]
+    fn stale_cancel_does_not_cancel_another_job() {
+        let job = local_job();
+        let flag = AtomicBool::new(false);
+        assert!(job.request_cancel("old", &flag).is_err());
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn successful_cancel_prevents_commit_and_committing_rejects_cancel() {
+        let mut job = local_job();
+        let flag = AtomicBool::new(false);
+        job.request_cancel("current", &flag).unwrap();
+        assert!(job.reserve_commit(&flag).is_err());
+        assert_eq!(job.stage, "transcribing");
+        let mut job = local_job();
+        let flag = AtomicBool::new(false);
+        job.reserve_commit(&flag).unwrap();
+        assert!(job.request_cancel("current", &flag).is_err());
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn audio_source_must_be_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("audio.wav")).unwrap();
+        assert!(find_audio_file(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audio_source_cannot_escape_meeting_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let external = other.path().join("other.wav");
+        std::fs::write(&external, b"audio").unwrap();
+        std::os::unix::fs::symlink(external, dir.path().join("audio.wav")).unwrap();
+        assert!(find_audio_file(dir.path()).is_err());
+    }
 
     #[test]
     fn test_create_transcript_segments_empty() {
@@ -862,9 +1245,9 @@ mod tests {
     #[test]
     fn test_create_transcript_segments_multiple() {
         let transcripts = vec![
-            ("First segment".to_string(), 0.0, 2000.0),      // 0-2 seconds
-            ("Second segment".to_string(), 3000.0, 5000.0),  // 3-5 seconds
-            ("Third segment".to_string(), 6500.0, 8000.0),   // 6.5-8 seconds
+            ("First segment".to_string(), 0.0, 2000.0), // 0-2 seconds
+            ("Second segment".to_string(), 3000.0, 5000.0), // 3-5 seconds
+            ("Third segment".to_string(), 6500.0, 8000.0), // 6.5-8 seconds
         ];
         let segments = create_transcript_segments(&transcripts);
 
@@ -891,9 +1274,7 @@ mod tests {
 
     #[test]
     fn test_create_transcript_segments_trims_whitespace() {
-        let transcripts = vec![
-            ("  Hello with spaces  ".to_string(), 0.0, 1000.0),
-        ];
+        let transcripts = vec![("  Hello with spaces  ".to_string(), 0.0, 1000.0)];
         let segments = create_transcript_segments(&transcripts);
 
         assert_eq!(segments.len(), 1);
@@ -988,7 +1369,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = find_audio_file(dir.path());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No audio file found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No audio file found"));
     }
 
     #[test]
@@ -1051,4 +1435,75 @@ mod tests {
         assert_eq!(metadata["custom_field"], "preserve me");
         assert!(metadata.get("detected_summary_language").is_none());
     }
+}
+
+/// Used only by the durable queue while holding the recorder's batch reservation.
+pub(crate) async fn execute_automatic<R: Runtime>(
+    app: AppHandle<R>,
+    job: &super::automatic_retranscription_store::Job,
+) -> Result<RetranscriptionResult, String> {
+    let guard = RetranscriptionGuard::acquire()?;
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    let (folder, started_at) =
+        retranscription_store::source(state.db_manager.pool(), &job.meeting_id).await?;
+    find_audio_file(Path::new(&folder)).map_err(|e| e.to_string())?;
+    let config: super::automatic_retranscription_store::Settings =
+        serde_json::from_value(job.config.clone()).map_err(|e| e.to_string())?;
+    let language = (config.language != "auto").then_some(config.language);
+    let hints = job
+        .config
+        .get("vocabulary")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    *JOB.lock().unwrap() = Some(RetranscriptionJob {
+        automatic: true,
+        job_id: job.job_id.clone(),
+        meeting_id: job.meeting_id.clone(),
+        state: "running".into(),
+        stage: "queued".into(),
+        progress_percentage: 0,
+        message: "Preparing saved audio automatically".into(),
+        error: None,
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        language: language.clone(),
+        vocabulary_terms: None,
+        effective_vocabulary: hints.clone(),
+        result: None,
+    });
+    let still_running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM automatic_retranscription_jobs WHERE job_id=? AND state='running'",
+    )
+    .bind(&job.job_id)
+    .fetch_one(state.db_manager.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+    if super::automatic_retranscription::was_preempted() || still_running == 0 {
+        preempt_automatic();
+    }
+    start_retranscription(
+        guard,
+        app,
+        job.meeting_id.clone(),
+        folder,
+        language,
+        Some(config.model),
+        Some(config.provider),
+        hints,
+        started_at,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+/// Saving is deliberately not cancellable; callers can wait for that short boundary.
+pub(crate) fn preempt_automatic() -> bool {
+    let job = JOB.lock().unwrap();
+    job.as_ref().is_some_and(|j| {
+        j.automatic
+            && j.request_cancel(&j.job_id, &RETRANSCRIPTION_CANCELLED)
+                .is_ok()
+    })
 }

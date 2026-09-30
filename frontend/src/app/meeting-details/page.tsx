@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { useRetranscriptionRefresh } from "@/hooks/useRetranscriptionRefresh";
 import { parseSummaryContent } from "@/lib/summary-content";
 
 interface MeetingDetailsResponse {
@@ -50,6 +51,8 @@ function MeetingDetailsContent() {
     error: transcriptError,
   } = usePaginatedTranscripts({ meetingId: meetingId || '' });
 
+  useRetranscriptionRefresh(meetingId || '', refetch);
+
   // Check if gemma3:1b model is available in Ollama
   const checkForGemmaModel = useCallback(async (): Promise<boolean> => {
     try {
@@ -86,7 +89,7 @@ function MeetingDetailsContent() {
       const currentConfig = await invoke('api_get_model_config') as any;
 
       // If DB already has a model, use it (never override!)
-      if (currentConfig && currentConfig.model) {
+      if (currentConfig && (currentConfig.provider === 'codex-cli' || currentConfig.model)) {
         console.log('Using existing model from DB:', currentConfig.model);
         setShouldAutoGenerate(true);
         setHasCheckedAutoGen(true);

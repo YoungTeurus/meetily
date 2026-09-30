@@ -34,7 +34,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
             ollamaEndpoint: data.ollamaEndpoint || 'default'
           });
           // Fetch API key if not included and provider requires it
-          if (data.provider !== 'ollama' && data.provider !== 'custom-openai' && !data.apiKey) {
+          if (data.provider !== 'ollama' && data.provider !== 'codex-cli' && data.provider !== 'custom-openai' && !data.apiKey) {
             try {
               const apiKeyData = await invokeTauri('api_get_api_key', {
                 provider: data.provider
@@ -114,6 +114,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
         model: configToSave.model,
         whisperModel: configToSave.whisperModel,
         apiKey: configToSave.apiKey ?? null,
+        codexBinaryPath: configToSave.codexBinaryPath ?? null,
         ollamaEndpoint: configToSave.ollamaEndpoint ?? null
       };
       console.log('Saving model config with payload:', payload);
@@ -137,6 +138,7 @@ export function useModelConfiguration({ serverAddress }: UseModelConfigurationPr
         whisperModel: payload.whisperModel,
         apiKey: payload.apiKey,
         ollamaEndpoint: payload.ollamaEndpoint,
+        codexBinaryPath: payload.codexBinaryPath,
       });
 
       console.log('Save model config success');

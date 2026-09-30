@@ -92,6 +92,9 @@ pub struct Setting {
     #[sqlx(rename = "ollamaEndpoint")]
     #[serde(rename = "ollamaEndpoint")]
     pub ollama_endpoint: Option<String>,
+    #[sqlx(rename = "codexBinaryPath", default)]
+    #[serde(rename = "codexBinaryPath", default)]
+    pub codex_binary_path: Option<String>,
     /// Custom OpenAI-compatible endpoint configuration stored as JSON
     #[sqlx(rename = "customOpenAIConfig")]
     #[serde(rename = "customOpenAIConfig")]
