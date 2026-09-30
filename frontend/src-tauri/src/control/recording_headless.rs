@@ -78,6 +78,7 @@ async fn count(pool: &SqlitePool, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn gui_cli_mcp_share_one_capture_and_finish_tails_after_caller_cancellation() {
+    let _test_boundary = super::TEST_BOUNDARY.lock().await;
     let temp = tempfile::tempdir().unwrap();
     let mut context = tauri::test::mock_context(tauri::test::noop_assets());
     // Absolute joining confines the real Store plugin's app-data directory to

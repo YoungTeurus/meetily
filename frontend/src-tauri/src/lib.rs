@@ -856,6 +856,10 @@ pub fn run() {
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
             audio::retranscription::is_retranscription_in_progress_command,
+            audio::retranscription::get_retranscription_status_command,
+            audio::retranscription::get_whisper_vocabulary,
+            audio::retranscription::save_global_whisper_vocabulary,
+            audio::retranscription::get_meeting_transcription_info,
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,

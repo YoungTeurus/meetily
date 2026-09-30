@@ -47,12 +47,14 @@ impl SummaryProcessesRepository {
             return Ok(false);
         }
         let now = Utc::now();
-        let update = sqlx::query("UPDATE summary_processes SET result = ?, updated_at = ? WHERE meeting_id = ?")
-            .bind(&result_json.unwrap())
-            .bind(now)
-            .bind(meeting_id)
-            .execute(&mut *transaction)
-            .await?;
+        let update = sqlx::query(
+            "UPDATE summary_processes SET result = ?, updated_at = ? WHERE meeting_id = ?",
+        )
+        .bind(&result_json.unwrap())
+        .bind(now)
+        .bind(meeting_id)
+        .execute(&mut *transaction)
+        .await?;
         if update.rows_affected() == 0 {
             transaction.rollback().await?;
             return Ok(false);
@@ -133,6 +135,7 @@ impl SummaryProcessesRepository {
         let result_str = serde_json::to_string(&result)
             .map_err(|e| sqlx::Error::Protocol(format!("Failed to serialize result: {}", e)))?;
 
+        let mut tx = pool.begin().await?;
         let update = sqlx::query(
             r#"
             UPDATE summary_processes
@@ -147,9 +150,19 @@ impl SummaryProcessesRepository {
         .bind(processing_time)
         .bind(meeting_id)
         .bind(started_at)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(update.rows_affected() == 1)
+        let completed = update.rows_affected() == 1;
+        if completed {
+            sqlx::query(
+                "UPDATE meeting_transcription_metadata SET summary_stale=0 WHERE meeting_id=?",
+            )
+            .bind(meeting_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(completed)
     }
 
     pub async fn update_process_failed(
@@ -241,6 +254,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("CREATE TABLE meeting_transcription_metadata(meeting_id TEXT PRIMARY KEY,transcript_revision INTEGER,summary_stale INTEGER)").execute(&pool).await.unwrap();
         pool
     }
 
@@ -268,31 +282,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_invalidates_old_summary_but_fresh_regeneration_clears_stale() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let old_start = Utc::now();
+        sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at) VALUES('m','Call',?,?)")
+            .bind(old_start)
+            .bind(old_start)
+            .execute(&pool)
+            .await
+            .unwrap();
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", old_start)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE summary_processes SET result='Partial summary',result_backup='User edited previous summary' WHERE meeting_id='m'").execute(&pool).await.unwrap();
+        let segment = crate::audio::retranscription_store::ReplacementSegment {
+            id: "new".into(),
+            text: "New transcript".into(),
+            timestamp: old_start.to_rfc3339(),
+            audio_start_time: Some(0.0),
+            audio_end_time: Some(1.0),
+            duration: Some(1.0),
+        };
+        crate::audio::retranscription_store::replace(&pool, "m", &[segment])
+            .await
+            .unwrap();
+        assert!(!SummaryProcessesRepository::update_process_completed(
+            &pool,
+            "m",
+            old_start,
+            json!({"markdown":"Old transcript summary"}),
+            1,
+            0.1
+        )
+        .await
+        .unwrap());
+        assert!(
+            crate::audio::retranscription_store::info(&pool, "m")
+                .await
+                .unwrap()
+                .summary_stale
+        );
+        let result: String =
+            sqlx::query_scalar("SELECT result FROM summary_processes WHERE meeting_id='m'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(result, "User edited previous summary");
+        let fresh_start = old_start + chrono::Duration::seconds(1);
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", fresh_start)
+            .await
+            .unwrap();
+        assert!(SummaryProcessesRepository::update_process_completed(
+            &pool,
+            "m",
+            fresh_start,
+            json!({"markdown":"New transcript summary"}),
+            1,
+            0.1
+        )
+        .await
+        .unwrap());
+        assert!(
+            !crate::audio::retranscription_store::info(&pool, "m")
+                .await
+                .unwrap()
+                .summary_stale
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_compare_and_set_preserves_first_writer() {
         let pool = test_pool().await;
         let completed_start = Utc::now();
         seed_pending(&pool, "completed-first", completed_start, None, None).await;
-        assert!(
-            SummaryProcessesRepository::update_process_completed(
-                &pool,
-                "completed-first",
-                completed_start,
-                json!({"markdown": "completed"}),
-                1,
-                1.0,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !SummaryProcessesRepository::update_process_cancelled(
-                &pool,
-                "completed-first",
-                completed_start,
-            )
-            .await
-            .unwrap()
-        );
+        assert!(SummaryProcessesRepository::update_process_completed(
+            &pool,
+            "completed-first",
+            completed_start,
+            json!({"markdown": "completed"}),
+            1,
+            1.0,
+        )
+        .await
+        .unwrap());
+        assert!(!SummaryProcessesRepository::update_process_cancelled(
+            &pool,
+            "completed-first",
+            completed_start,
+        )
+        .await
+        .unwrap());
         let completed_status: String = sqlx::query_scalar(
             "SELECT status FROM summary_processes WHERE meeting_id = 'completed-first'",
         )
@@ -311,27 +391,23 @@ mod tests {
             Some(previous),
         )
         .await;
-        assert!(
-            SummaryProcessesRepository::update_process_cancelled(
-                &pool,
-                "cancelled-first",
-                cancelled_start,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !SummaryProcessesRepository::update_process_completed(
-                &pool,
-                "cancelled-first",
-                cancelled_start,
-                json!({"markdown": "completed"}),
-                1,
-                1.0,
-            )
-            .await
-            .unwrap()
-        );
+        assert!(SummaryProcessesRepository::update_process_cancelled(
+            &pool,
+            "cancelled-first",
+            cancelled_start,
+        )
+        .await
+        .unwrap());
+        assert!(!SummaryProcessesRepository::update_process_completed(
+            &pool,
+            "cancelled-first",
+            cancelled_start,
+            json!({"markdown": "completed"}),
+            1,
+            1.0,
+        )
+        .await
+        .unwrap());
         let cancelled: (String, String) = sqlx::query_as(
             "SELECT status, result FROM summary_processes WHERE meeting_id = 'cancelled-first'",
         )
@@ -346,20 +422,19 @@ mod tests {
         let pool = test_pool().await;
         let current_start = Utc::now();
         seed_pending(&pool, "stale-cancel", current_start, None, None).await;
-        assert!(
-            !SummaryProcessesRepository::update_process_cancelled(
-                &pool,
-                "stale-cancel",
-                current_start - chrono::Duration::nanoseconds(1),
-            )
-            .await
-            .unwrap()
-        );
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM summary_processes WHERE meeting_id = 'stale-cancel'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        assert!(!SummaryProcessesRepository::update_process_cancelled(
+            &pool,
+            "stale-cancel",
+            current_start - chrono::Duration::nanoseconds(1),
+        )
+        .await
+        .unwrap());
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM summary_processes WHERE meeting_id = 'stale-cancel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(status, "PENDING");
     }
 }

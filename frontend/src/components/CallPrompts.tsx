@@ -39,13 +39,15 @@ export function CallPrompts({ compact = false }: { compact?: boolean }) {
     finally { setPending(null); }
   };
   const prompts = status?.settings.enabled ? status.prompts : [];
+  const uncertain = status?.sessions.some(session=>session.phase==='uncertain' && !session.suppressed);
   if (!compact && !prompts.length) return null;
   return <aside aria-label="Предложения записи звонков" aria-live="polite" className={compact ? 'p-5 space-y-4' : 'fixed z-50 bottom-6 right-6 w-[min(420px,calc(100vw-2rem))] space-y-3'}>
     {error && <p role="alert" className="rounded bg-red-50 p-3 text-sm text-red-800">{error}</p>}
-    {compact && !prompts.length && <div><h1 className="text-lg font-semibold">Нет текущего предложения</h1><p className="mt-2 text-sm text-gray-600">Звонок уже завершён или действие выполнено.</p><Button className="mt-4" variant="outline" onClick={() => void invoke('close_call_action')}>Закрыть</Button></div>}
+    {compact && !prompts.length && <div><h1 className="text-lg font-semibold">{uncertain ? 'Проверяем состояние звонка' : 'Нет текущего предложения'}</h1><p className="mt-2 text-sm text-gray-600">{uncertain ? 'Приложение звонка временно не показывает его состояние. Запись не началась.' : 'Звонок уже завершён или действие выполнено.'}</p><Button className="mt-4" variant="outline" onClick={() => void invoke('close_call_action')}>Закрыть</Button></div>}
     {prompts.map(prompt => <div key={`${prompt.session_id}:${prompt.kind}`} className="rounded-lg border bg-white p-5 shadow-lg">
       <div className="flex justify-between gap-3"><h2 className="font-semibold">{prompt.kind === 'start' ? 'Обнаружен звонок' : 'Звонок завершён'} · {appNames[prompt.application] ?? prompt.application}</h2><button aria-label="Закрыть предложение" disabled={!!pending} onClick={() => void act(prompt, 'dismiss')} className="text-gray-500 hover:text-gray-900">×</button></div>
       <p className="mt-2 text-sm text-gray-600">{prompt.kind === 'start' ? 'Будут записаны микрофон и системный звук всего компьютера, включая другие приложения.' : 'Завершить запись и сохранить транскрипт встречи?'}</p>
+      {prompt.kind==='start' && status?.sessions.some(s=>s.session_id===prompt.session_id && s.phase==='uncertain') && <p className="mt-2 text-sm text-gray-600">После нажатия проверим звонок ещё раз. При необходимости покажем окно {appNames[prompt.application] ?? prompt.application}, чтобы подтвердить его состояние.</p>}
       <div className="mt-4 flex gap-2"><Button disabled={!!pending} onClick={() => void act(prompt, prompt.kind === 'start' ? 'start' : 'stop')}>{pending === prompt.session_id ? 'Подождите…' : prompt.kind === 'start' ? 'Начать запись' : 'Завершить и сохранить'}</Button><Button variant="outline" disabled={!!pending} onClick={() => void act(prompt, prompt.kind === 'start' ? 'skip' : 'dismiss')}>{prompt.kind === 'start' ? 'Пропустить' : 'Продолжить запись'}</Button></div>
     </div>)}
   </aside>;

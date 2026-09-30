@@ -34,6 +34,8 @@ pub struct Session {
     stop_offered: bool,
     #[serde(skip)]
     stop_suppressed: bool,
+    #[serde(skip)]
+    uncertain_since: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Prompt {
@@ -54,7 +56,7 @@ impl Engine {
         self.sessions
             .values()
             .filter_map(|s| {
-                let kind = if s.phase == Phase::InCall
+                let kind = if [Phase::InCall, Phase::Uncertain].contains(&s.phase)
                     && s.offered
                     && !s.suppressed
                     && s.recording_id.is_none()
@@ -133,6 +135,7 @@ impl Engine {
                         offered: false,
                         stop_offered: false,
                         stop_suppressed: false,
+                        uncertain_since: None,
                     },
                 );
             }
@@ -144,6 +147,7 @@ impl Engine {
             match o.state {
                 CallState::ConfirmedCall => {
                     s.absent_since = None;
+                    s.uncertain_since = None;
                     if s.phase == Phase::Ended {
                         if s.recording_id.is_some() {
                             s.phase = Phase::InCall;
@@ -178,6 +182,7 @@ impl Engine {
                     }
                 }
                 CallState::NoCall => {
+                    s.uncertain_since = None;
                     if s.phase == Phase::Candidate {
                         s.positive_since = now;
                         s.phase = Phase::Ended;
@@ -215,6 +220,10 @@ impl Engine {
                         s.positive_since = now;
                     } else if s.phase != Phase::Ended {
                         s.phase = Phase::Uncertain;
+                        let since = *s.uncertain_since.get_or_insert(now);
+                        if now.saturating_sub(since) >= settings.grace_ms {
+                            s.offered = false;
+                        }
                     }
                 }
             }
@@ -238,6 +247,23 @@ impl Engine {
             return Err("stale_or_suppressed_detection_session".into());
         }
         Ok(s.application.clone())
+    }
+    /// A retained offer may request fresh UI evidence, but cannot authorize capture.
+    pub fn revalidation_identity(&self, id: &str) -> Result<String, String> {
+        let s = self
+            .sessions
+            .values()
+            .find(|s| s.session_id == id)
+            .ok_or("stale_detection_session")?;
+        if ![Phase::InCall, Phase::Uncertain].contains(&s.phase)
+            || !s.offered
+            || s.suppressed
+            || s.starting
+            || s.recording_id.is_some()
+        {
+            return Err("stale_or_suppressed_detection_session".into());
+        }
+        Ok(s.identity.clone())
     }
     pub fn attach_recording(&mut self, id: &str, recording_id: &str) -> Result<(), String> {
         let s = self.find_mut(id)?;

@@ -262,3 +262,49 @@ fn dismissed_stop_offer_does_not_repeat() {
     update(&mut e, CallState::NoCall, 25000);
     assert!(e.prompts().is_empty());
 }
+
+#[test]
+fn transient_focus_loss_keeps_offer_without_authorizing_capture() {
+    let mut e = Engine::default();
+    update(&mut e, CallState::ConfirmedCall, 0);
+    update(&mut e, CallState::ConfirmedCall, 3000);
+    let id = e.sessions()[0].session_id.clone();
+    update(&mut e, CallState::Unknown, 4000);
+    assert_eq!(e.sessions()[0].phase, Phase::Uncertain);
+    assert_eq!(
+        e.prompts()[0].session_id,
+        id,
+        "temporary AX loss must not erase the user's action"
+    );
+    assert!(
+        e.authorize_start(&id).is_err(),
+        "retained offer is not capture authorization"
+    );
+    update(&mut e, CallState::ConfirmedCall, 5000);
+    assert!(e.authorize_start(&id).is_ok());
+}
+
+#[test]
+fn prolonged_unknown_does_not_keep_a_start_offer_forever() {
+    let mut e = Engine::default();
+    update(&mut e, CallState::ConfirmedCall, 0);
+    update(&mut e, CallState::ConfirmedCall, 3000);
+    update(&mut e, CallState::Unknown, 4000);
+    assert_eq!(e.prompts().len(), 1);
+    update(&mut e, CallState::Unknown, 24000);
+    assert!(e.prompts().is_empty());
+}
+
+#[test]
+fn retained_focus_offer_still_requires_same_process_and_rejects_positive_exit() {
+    let mut e = Engine::default();
+    update(&mut e, CallState::ConfirmedCall, 0);
+    update(&mut e, CallState::ConfirmedCall, 3000);
+    let id = e.sessions()[0].session_id.clone();
+    update(&mut e, CallState::Unknown, 4000);
+    assert_eq!(e.revalidation_identity(&id).unwrap(), "10-creation1");
+    assert!(e.validate_identity(&id, Some("10-creation2")).is_err());
+    update(&mut e, CallState::NoCall, 4500);
+    assert!(e.revalidation_identity(&id).is_err());
+    assert!(e.authorize_start(&id).is_err());
+}

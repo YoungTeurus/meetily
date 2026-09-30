@@ -37,7 +37,7 @@ impl RpcError {
             | "recording_transition_failed" => 3,
             "unauthorized" | "forbidden" => 4,
             "not_found" | "no_recording" | "unknown_method" => 5,
-            "conflict" | "recording_active" | "recording_mismatch" => 6,
+            "conflict" | "recording_active" | "recording_mismatch" | "audio_busy" => 6,
             "timeout" => 7,
             _ => 1,
         }

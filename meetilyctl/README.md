@@ -58,7 +58,7 @@ Watch emits NDJSON regardless of `--json`, with durable event IDs, ISO 8601 even
 | 3 | App/gateway unavailable, setup incomplete, recording start/transition failed |
 | 4 | Unauthorized, revoked key or forbidden scope |
 | 5 | Meeting/recording/method not found, no active recording |
-| 6 | Conflicting lifecycle operation, recording already active or mismatched ID |
+| 6 | Conflicting lifecycle operation, audio batch/model operation active, mismatched ID, or transcript revision changed during pagination |
 | 7 | Gateway request/wait timed out |
 
 ## Connect local Codex

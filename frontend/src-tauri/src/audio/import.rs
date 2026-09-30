@@ -260,12 +260,24 @@ pub async fn start_import<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<ImportResult> {
-    // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
-
-    // Reset cancellation flag
+    let batch_guard = crate::control::recording::reserve_batch().map_err(|e| anyhow!(e))?;
+    let import_guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
     IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+    start_import_reserved(app, source_path, title, language, model, provider, (import_guard, batch_guard)).await
+}
 
+async fn start_import_reserved<R: Runtime>(
+    app: AppHandle<R>,
+    source_path: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    _guards: (ImportGuard, crate::control::recording::BatchGuard),
+) -> Result<ImportResult> {
+    // Offline jobs retain the shared recording transition boundary throughout
+    // processing and cleanup, preventing a live start during model replacement.
+    let engine_guard = super::common::acquire_engine_lifecycle_lock().await;
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let result = run_import(
         app.clone(),
@@ -277,6 +289,8 @@ pub async fn start_import<R: Runtime>(
     )
     .await;
 
+    // Cleanup reacquires this lifecycle lock; release it first to avoid deadlock.
+    drop(engine_guard);
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
 
@@ -508,6 +522,16 @@ async fn run_import<R: Runtime>(
 
     emit_progress(&app, "transcribing", 30, "Loading transcription engine...");
 
+    // Snapshot global hints once for this import, before loading the model.
+    let initial_prompt = if !use_parakeet && total_segments > 0 {
+        let state = app.try_state::<AppState>()
+            .ok_or_else(|| anyhow!("App state unavailable for vocabulary hints"))?;
+        let vocabulary = crate::database::repositories::vocabulary::VocabularyRepository::get_global(
+            state.db_manager.pool(),
+        ).await.map_err(|error| anyhow!("Unable to load vocabulary hints: {error}"))?;
+        crate::database::repositories::vocabulary::VocabularyRepository::merge(None, vocabulary.as_deref())
+    } else { None };
+
     // Initialize the appropriate engine
     let whisper_engine = if !use_parakeet && total_segments > 0 {
         Some(get_or_init_whisper(&app, model.as_deref()).await?)
@@ -590,7 +614,7 @@ async fn run_import<R: Runtime>(
         } else {
             let engine = whisper_engine.as_ref().unwrap();
             let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+                .transcribe_audio_with_confidence_and_prompt(segment.samples.clone(), language.clone(), initial_prompt.as_deref())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             (text, conf)
@@ -975,9 +999,15 @@ pub async fn start_import_audio_command<R: Runtime>(
         return Err("Import already in progress".to_string());
     }
 
+    // Reserve before returning the acknowledgement so a conflicting recording
+    // or offline job reports an error immediately instead of silently stalling UI.
+    let batch_guard = crate::control::recording::reserve_batch()?;
+    let import_guard = ImportGuard::acquire()?;
+    IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+
     // Spawn import in background
     tauri::async_runtime::spawn(async move {
-        let result = start_import(app, source_path, title, language, model, provider).await;
+        let result = start_import_reserved(app, source_path, title, language, model, provider, (import_guard, batch_guard)).await;
 
         if let Err(e) = result {
             error!("Import failed: {}", e);

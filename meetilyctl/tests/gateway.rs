@@ -68,6 +68,7 @@ fn stable_exit_codes_and_invalid_discovery() {
         ("no_recording", 5),
         ("recording_active", 6),
         ("recording_mismatch", 6),
+        ("audio_busy", 6),
         ("unavailable", 3),
         ("forbidden", 4),
         ("not_found", 5),

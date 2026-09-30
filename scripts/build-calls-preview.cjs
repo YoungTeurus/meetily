@@ -63,6 +63,8 @@ run(process.execPath, [join(root, 'frontend/node_modules/@tauri-apps/cli/tauri.j
 const artifacts = join(root, `artifacts/calls-preview-${target}`);
 mkdirSync(artifacts, { recursive: true });
 copyFileSync(join(root, 'LICENSE.md'), join(artifacts, 'LICENSE.md'));
+copyFileSync(join(root, 'vendor/cpal/LICENSE'), join(artifacts, 'CPAL-LICENSE.txt'));
+copyFileSync(join(root, 'vendor/cpal/MEETILY-PATCH.md'), join(artifacts, 'CPAL-PATCH.md'));
 copyFileSync(join(root, 'docs/implementation/native-build.md'), join(artifacts, 'native-build.md'));
 copyFileSync(join(root, `target/${target}/release/meetilyctl${extension}`), join(artifacts, `meetilyctl${extension}`));
 writeFileSync(join(artifacts, 'BUILD-INFO.txt'), [

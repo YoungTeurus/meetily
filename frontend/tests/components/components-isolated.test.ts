@@ -7,10 +7,11 @@ import { fileURLToPath } from 'node:url';
 // fixture in a fresh Bun process so it tests the real component and cannot inherit
 // or leak another suite's mocks. Every fixture still runs all behavioral tests.
 const fixtures = [
-  ['call-prompts', 4],
+  ['call-prompts', 6],
   ['recording-finalized', 3],
   ['recording-state-finalized', 2],
   ['onboarding-database-choice', 4],
+  ['retranscription-ui', 17],
 ] as const;
 
 for (const [name, assertions] of fixtures) {

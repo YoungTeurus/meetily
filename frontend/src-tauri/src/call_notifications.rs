@@ -8,6 +8,7 @@ use tauri_plugin_notification::NotificationExt;
 static WINDOW_SESSIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn open_action_window(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    log::info!(target:"call_detection","open action window session={session_id}");
     if let Ok(mut sessions) = WINDOW_SESSIONS.lock() {
         if !sessions.iter().any(|session| session == session_id) {
             sessions.push(session_id.to_string());
@@ -33,6 +34,7 @@ pub fn open_action_window(app: &AppHandle, session_id: &str) -> Result<(), Strin
     let handle = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::CloseRequested { .. }) {
+            log::info!(target:"call_detection","action window close requested; dismissing visible offers");
             // Closing the shared compact window dismisses every visible proposal,
             // including simultaneous apps whose toast was not individually clicked.
             let mut sessions = WINDOW_SESSIONS

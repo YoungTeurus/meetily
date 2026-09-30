@@ -14,6 +14,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 static TRANSITION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+pub(crate) static TEST_BOUNDARY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static ACTIVE: Mutex<Option<persistence::Session>> = Mutex::new(None);
 static FAILURE: Mutex<Option<String>> = Mutex::new(None);
 static PENDING: Mutex<Vec<TranscriptUpdate>> = Mutex::new(Vec::new());
@@ -21,6 +23,32 @@ static PENDING: Mutex<Vec<TranscriptUpdate>> = Mutex::new(Vec::new());
 static DRAINED: Mutex<Option<Option<String>>> = Mutex::new(None);
 static CAPTURE_FOLDER: Mutex<Option<String>> = Mutex::new(None);
 static FILE_DIRTY: Mutex<bool> = Mutex::new(false);
+static BATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_active() -> bool {
+    active().is_some()
+}
+
+/// An offline job owns the same transition boundary as capture. It never opens
+/// a recorder. A start that observes this reservation returns an audio-busy error.
+pub(crate) struct BatchGuard {
+    _transition: tokio::sync::MutexGuard<'static, ()>,
+}
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        BATCH_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub(crate) fn reserve_batch() -> Result<BatchGuard, String> {
+    let guard = TRANSITION
+        .try_lock()
+        .map_err(|_| "Recording or another audio operation is in progress".to_string())?;
+    if is_active() {
+        return Err("Stop the active recording before processing saved audio".into());
+    }
+    BATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(BatchGuard { _transition: guard })
+}
 
 fn db<R: Runtime>(app: &AppHandle<R>) -> Result<SqlitePool, ControlError> {
     app.try_state::<AppState>()
@@ -166,6 +194,12 @@ async fn dispatch_inner<R: Runtime>(
 ) -> Result<Value, ControlError> {
     if method == "recording.status" || method == "status" {
         return session_status(&app, &params).await;
+    }
+    if method == "recording.start" && BATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ControlError::new(
+            "audio_busy",
+            "Saved audio is being processed; wait or cancel that job before recording",
+        ));
     }
     let _guard = TRANSITION.lock().await;
     let pool = db(&app)?;

@@ -88,6 +88,25 @@ impl Settings {
 pub trait Observer {
     fn observe(&mut self, at_ms: u64) -> Vec<Observation>;
 }
+/// Applies observations in per-application timestamp order.
+pub fn merge_latest_observations(
+    current: &mut Vec<Observation>,
+    incoming: Vec<Observation>,
+) -> Vec<Observation> {
+    let mut accepted = vec![];
+    for observation in incoming {
+        if current.iter().any(|o| {
+            o.application == observation.application
+                && o.observed_at_ms > observation.observed_at_ms
+        }) {
+            continue;
+        }
+        current.retain(|o| o.application != observation.application);
+        current.push(observation.clone());
+        accepted.push(observation);
+    }
+    accepted
+}
 
 /// UI adapters read only call-control names, never chat bodies or window document text.
 pub fn call_control_matches(
@@ -130,5 +149,84 @@ pub fn call_control_matches(
                 })
         }
         _ => false,
+    }
+}
+
+/// Classifies a readable Zoom UI snapshot. Menu entries include their enabled state.
+pub fn classify_zoom_controls(
+    button_names: &[String],
+    menu_commands: Option<&[(String, bool)]>,
+) -> CallState {
+    if call_control_matches("zoom", button_names, &[]) {
+        return CallState::ConfirmedCall;
+    }
+    let Some(menu) = menu_commands else {
+        return CallState::Unknown;
+    };
+    if menu
+        .iter()
+        .any(|(name, enabled)| *enabled && zoom_meeting_command(name).is_some())
+    {
+        return CallState::ConfirmedCall;
+    }
+    // Disabled menu commands alone are inconclusive (modal dialogs can disable them).
+    // Positive exit requires the readable idle home controls as well.
+    let labels: Vec<_> = button_names
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+    let join = labels
+        .iter()
+        .any(|s| ["join", "join meeting", "войти", "войти в конференцию"].contains(&s.as_str()));
+    let new = labels
+        .iter()
+        .any(|s| ["new meeting", "новая конференция"].contains(&s.as_str()));
+    let explicitly_idle = menu
+        .iter()
+        .any(|(name, enabled)| !*enabled && zoom_meeting_command(name) == Some("leave"));
+    if join && new && explicitly_idle {
+        CallState::NoCall
+    } else {
+        CallState::Unknown
+    }
+}
+/// A Home window alongside another unclassified Zoom window does not prove exit.
+pub fn classify_zoom_window_set(
+    buttons: &[String],
+    menu: Option<&[(String, bool)]>,
+    windows: usize,
+) -> CallState {
+    let state = classify_zoom_controls(buttons, menu);
+    if state == CallState::NoCall && windows != 1 {
+        CallState::Unknown
+    } else {
+        state
+    }
+}
+/// Recognizes only explicit meeting commands, not generic menu End/Leave labels.
+pub fn zoom_meeting_command(name: &str) -> Option<&'static str> {
+    let label = name
+        .trim()
+        .trim_end_matches(['…', '.'])
+        .trim()
+        .to_lowercase();
+    if [
+        "leave meeting",
+        "покинуть конференцию",
+        "выйти из конференции",
+    ]
+    .contains(&label.as_str())
+    {
+        Some("leave")
+    } else if [
+        "end meeting",
+        "завершить конференцию",
+        "завершить конференцию для всех",
+    ]
+    .contains(&label.as_str())
+    {
+        Some("end")
+    } else {
+        None
     }
 }

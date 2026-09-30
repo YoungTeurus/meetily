@@ -114,6 +114,46 @@ pub struct SystemAudioStoppedPayload;
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_device_enumeration_survives_caller_thread_teardown() {
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        fn enumerate() {
+            let host = cpal::default_host();
+            // Empty lists and absent defaults are valid on a headless runner.
+            // COM objects must stay usable even after an earlier caller exits.
+            for device in host.devices().expect("WASAPI enumeration failed") {
+                device.name().expect("WASAPI device name failed");
+            }
+            for device in [host.default_input_device(), host.default_output_device()]
+                .into_iter()
+                .flatten()
+            {
+                device.name().expect("WASAPI default device name failed");
+            }
+        }
+
+        for _ in 0..3 {
+            std::thread::spawn(enumerate)
+                .join()
+                .expect("Sequential WASAPI caller failed");
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    enumerate();
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().expect("Concurrent WASAPI caller failed");
+        }
+    }
+
     #[tokio::test]
     async fn test_list_system_audio_devices() {
         let devices = list_system_audio_devices_command().await;

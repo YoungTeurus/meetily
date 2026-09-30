@@ -20,7 +20,7 @@ use std::sync::{LazyLock, Mutex};
 use tauri::{AppHandle, Runtime};
 
 
-static SUMMARY_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+pub(crate) static SUMMARY_START_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static LAST_SUMMARY_START: LazyLock<Mutex<Option<DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -475,6 +475,7 @@ pub async fn api_process_transcript<R: Runtime>(
 ) -> Result<ProcessTranscriptResponse, String> {
     use uuid::Uuid;
 
+    let existing_meeting = meeting_id.is_some();
     let m_id = meeting_id.unwrap_or_else(|| format!("meeting-{}", Uuid::new_v4()));
     log_info!(
         "api_process_transcript (native) called for meeting_id: {}, model: {}",
@@ -494,6 +495,14 @@ pub async fn api_process_transcript<R: Runtime>(
 
     // ponytail: summary starts are rare; use per-meeting locks only if start contention is measured.
     let _start_guard = SUMMARY_START_LOCK.lock().await;
+    // A window can hold an old transcript after a background replacement.
+    // Read the source under the same boundary used by that replacement.
+    let text = if existing_meeting {
+        let segments: Vec<String> = sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id=? ORDER BY COALESCE(audio_start_time,0),id")
+            .bind(&m_id).fetch_all(&pool).await.map_err(|e|e.to_string())?;
+        if segments.is_empty() { return Err("Meeting has no saved transcript to summarize".into()); }
+        segments.join("\n")
+    } else { text };
     let started_at = next_summary_start(Utc::now());
     SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, started_at)
         .await

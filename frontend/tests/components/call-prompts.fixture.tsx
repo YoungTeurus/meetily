@@ -52,4 +52,17 @@ describe('Call notification actions', () => {
     expect(JSON.stringify(renderer!.toJSON())).toContain('Сессия уже завершена');
     expect(invoke.mock.calls.some(call => call[0] === 'close_call_action')).toBe(false);
   });
+  test('transient AX loss keeps the offered action and explains fresh verification', async()=>{
+    status={...status,sessions:[{session_id:'session-1',application:'zoom',phase:'uncertain',suppressed:false}],observations:[{application:'zoom',state:'unknown',confidence:'none',limitations:['Toolbar not exposed'],evidence:[]}]};
+    await mount();
+    expect(JSON.stringify(renderer!.toJSON())).toContain('проверим');
+    await click('Начать запись');
+    expect(actions()).toEqual([['detection_action',{sessionId:'session-1',action:'start'}]]);
+  });
+  test('no offer during uncertain observation does not say the call ended',async()=>{
+    status={...status,prompts:[],sessions:[{session_id:'session-1',application:'zoom',phase:'uncertain',suppressed:false}],observations:[{application:'zoom',state:'unknown',confidence:'none',limitations:['Toolbar not exposed'],evidence:[]}]};
+    await mount();const content=JSON.stringify(renderer!.toJSON());
+    expect(content).toContain('Проверяем состояние звонка');
+    expect(content).not.toContain('Звонок уже завершён');
+  });
 });

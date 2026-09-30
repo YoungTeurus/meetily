@@ -9,6 +9,7 @@ on:
       - 'local-control/**'
       - 'call-detection/**'
       - 'meetilyctl/**'
+      - 'vendor/cpal/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/build-calls-preview.cjs'

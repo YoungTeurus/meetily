@@ -1,7 +1,10 @@
 //! Public CoreAudio process objects (macOS 14.2+) and a bounded, read-only AX adapter.
 //! No taps, screen capture, keyboard hooks, or chat-message values are used.
 #![allow(unexpected_cfgs)] // objc 0.2 emits obsolete cargo-clippy feature checks inside macros.
-use crate::{call_control_matches, CallState, Observation, Observer};
+use crate::{
+    call_control_matches, classify_zoom_controls, classify_zoom_window_set, zoom_meeting_command,
+    CallState, Observation, Observer,
+};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::{
@@ -54,6 +57,8 @@ extern "C" {
     fn CFArrayGetCount(array: CFRef) -> isize;
     fn CFArrayGetValueAtIndex(array: CFRef, index: isize) -> CFRef;
     fn CFRetain(value: CFRef) -> CFRef;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(value: CFRef) -> bool;
 }
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
@@ -274,9 +279,71 @@ unsafe fn discord_status(button: CFRef) -> Vec<String> {
     }
     names
 }
-unsafe fn controls(pid: u32, application: &str) -> Result<bool, String> {
+unsafe fn zoom_menu_commands(root: CFRef) -> Option<Vec<(String, bool)>> {
+    let menu = attr(root, "AXMenuBar")?;
+    let mut stack = vec![(menu, 0)];
+    let mut commands = vec![];
+    let mut count = 0;
+    let start = std::time::Instant::now();
+    while let Some((node, depth)) = stack.pop() {
+        count += 1;
+        if count > 192 || start.elapsed() > std::time::Duration::from_millis(200) {
+            return None;
+        }
+        let role = text_attr(node.0, "AXRole")?;
+        if role == "AXMenuItem" {
+            if let Some(title) = text_attr(node.0, "AXTitle") {
+                if zoom_meeting_command(&title).is_some() {
+                    let enabled = attr(node.0, "AXEnabled")?;
+                    if CFGetTypeID(enabled.0) != CFBooleanGetTypeID() {
+                        return None;
+                    }
+                    commands.push((title, CFBooleanGetValue(enabled.0)));
+                    if commands
+                        .last()
+                        .map(|(_, enabled)| *enabled)
+                        .unwrap_or(false)
+                    {
+                        return Some(commands);
+                    }
+                }
+            }
+        }
+        let children = attr(node.0, "AXChildren");
+        if children.is_none() && ["AXMenuBar", "AXMenu", "AXMenuBarItem"].contains(&role.as_str()) {
+            return None;
+        }
+        if let Some(children) = children {
+            if CFGetTypeID(children.0) != CFArrayGetTypeID() {
+                return None;
+            }
+            let size = CFArrayGetCount(children.0);
+            if size > 128 || (depth >= 5 && size > 0) {
+                return None;
+            }
+            for i in (0..size).rev() {
+                stack.push((
+                    OwnedCF(CFRetain(CFArrayGetValueAtIndex(children.0, i))),
+                    depth + 1,
+                ));
+            }
+        }
+    }
+    Some(commands)
+}
+unsafe fn controls(pid: u32, application: &str) -> Result<CallState, String> {
     let root = OwnedCF(AXUIElementCreateApplication(pid as i32));
     AXUIElementSetMessagingTimeout(root.0, 0.15);
+    let menu_commands = if application == "zoom" {
+        zoom_menu_commands(root.0)
+    } else {
+        None
+    };
+    if application == "zoom"
+        && classify_zoom_controls(&[], menu_commands.as_deref()) == CallState::ConfirmedCall
+    {
+        return Ok(CallState::ConfirmedCall);
+    }
     // AXWindows existence distinguishes inaccessible/unresponsive from an empty readable tree.
     let windows = attr(root.0, "AXWindows")
         .ok_or("App accessibility tree unavailable; detection cannot confirm call state")?;
@@ -305,6 +372,28 @@ unsafe fn controls(pid: u32, application: &str) -> Result<bool, String> {
         if role == "AXButton" || role == "AXMenuButton" {
             for key in ["AXTitle", "AXDescription", "AXHelp"] {
                 if let Some(s) = text_attr(node.0, key) {
+                    // Idle evidence must come from enabled controls; a modal/live
+                    // meeting can leave disabled Home controls in the AX tree.
+                    let label = s.trim().to_lowercase();
+                    if [
+                        "join",
+                        "join meeting",
+                        "войти",
+                        "войти в конференцию",
+                        "new meeting",
+                        "новая конференция",
+                    ]
+                    .contains(&label.as_str())
+                    {
+                        let Some(enabled) = attr(node.0, "AXEnabled") else {
+                            continue;
+                        };
+                        if CFGetTypeID(enabled.0) != CFBooleanGetTypeID()
+                            || !CFBooleanGetValue(enabled.0)
+                        {
+                            continue;
+                        }
+                    }
                     buttons.push(s);
                 }
             }
@@ -323,7 +412,7 @@ unsafe fn controls(pid: u32, application: &str) -> Result<bool, String> {
             }
         }
         if call_control_matches(application, &buttons, &status) {
-            return Ok(true);
+            return Ok(CallState::ConfirmedCall);
         }
         if depth < 14 && !["AXTextArea", "AXList", "AXTable"].contains(&role.as_str()) {
             let children_attribute = attr(node.0, "AXChildren");
@@ -364,7 +453,15 @@ unsafe fn controls(pid: u32, application: &str) -> Result<bool, String> {
     {
         return Err("Disconnect control is present, but connected status is unavailable; call state unknown".into());
     }
-    Ok(false)
+    if application == "zoom" {
+        Ok(classify_zoom_window_set(
+            &buttons,
+            menu_commands.as_deref(),
+            CFArrayGetCount(windows.0) as usize,
+        ))
+    } else {
+        Ok(CallState::NoCall)
+    }
 }
 pub struct NativeObserver;
 impl NativeObserver {
@@ -435,7 +532,7 @@ impl Observer for NativeObserver {
                         o.limitations.push("Accessibility permission is required to distinguish a call from music, microphone tests, and text chat. Enable Meetily in System Settings → Privacy & Security → Accessibility.".into());
                     } else {
                         match controls(app.pid, name) {
-                            Ok(true) => {
+                            Ok(CallState::ConfirmedCall) => {
                                 o.state = CallState::ConfirmedCall;
                                 o.confidence = if signals
                                     .get(&app.pid)
@@ -447,14 +544,15 @@ impl Observer for NativeObserver {
                                     "medium"
                                 }
                                 .into();
-                                o.evidence.push("Application call-specific controls are visible in Accessibility".into());
+                                o.evidence.push("Application call-specific controls or enabled meeting commands verified in Accessibility".into());
                             }
-                            Ok(false) => {
+                            Ok(CallState::NoCall) => {
                                 o.state = CallState::NoCall;
                                 o.evidence.push(
-                                    "Readable application UI has no supported call controls".into(),
+                                    "Readable application UI confirms the idle home controls with no enabled meeting command".into(),
                                 );
                             }
+                            Ok(_)=>o.limitations.push("Zoom call controls are temporarily not exposed; absence of a toolbar is not an observed exit".into()),
                             Err(e) => o.limitations.push(e),
                         }
                     }
@@ -475,5 +573,61 @@ impl Observer for NativeObserver {
             let _: () = msg_send![pool, drain];
             result
         }
+    }
+}
+
+/// Called only after an explicit Start click. Foreground restoration is a fallback,
+/// and fresh app-specific evidence plus the original creation identity are mandatory.
+pub fn revalidate(application: &str, identity: &str, at: u64) -> Result<Observation, String> {
+    unsafe {
+        let pool: *mut Object = msg_send![class!(NSAutoreleasePool), new];
+        let result = (|| {
+            let original = running_apps()
+                .into_iter()
+                .find(|a| a.name == application && a.identity.as_deref() == Some(identity))
+                .ok_or("Call application exited or its process identity changed")?;
+            let mut observer = NativeObserver::new();
+            let observation = observer
+                .observe(at)
+                .into_iter()
+                .find(|o| o.application == application)
+                .ok_or("Application observation unavailable")?;
+            if observation.process_identity.as_deref() != Some(identity) {
+                return Err("Call application process identity changed".into());
+            }
+            if observation.state == CallState::ConfirmedCall
+                || observation.state == CallState::NoCall
+            {
+                return Ok(observation);
+            }
+            let app: *mut Object = msg_send![class!(NSRunningApplication),runningApplicationWithProcessIdentifier:original.pid as i32];
+            if app.is_null() {
+                return Err("Call application exited".into());
+            }
+            let activated: bool = msg_send![app,activateWithOptions:2usize];
+            if !activated {
+                return Err("Could not show the call application for verification".into());
+            }
+            let start = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let fresh_at = at.saturating_add(start.elapsed().as_millis() as u64);
+                let observation = observer
+                    .observe(fresh_at)
+                    .into_iter()
+                    .find(|o| o.application == application)
+                    .ok_or("Application observation unavailable")?;
+                if observation.process_identity.as_deref() != Some(identity) {
+                    return Err("Call application exited or its process identity changed".into());
+                }
+                if observation.state != CallState::Unknown
+                    || start.elapsed() >= std::time::Duration::from_secs(3)
+                {
+                    return Ok(observation);
+                }
+            }
+        })();
+        let _: () = msg_send![pool, drain];
+        result
     }
 }

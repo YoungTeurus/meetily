@@ -78,6 +78,8 @@ async fn get_meeting(pool: &SqlitePool, id: &str) -> Result<Value, ControlError>
 #[derive(Serialize, Deserialize)]
 struct TranscriptCursor {
     meeting_id: String,
+    #[serde(default)]
+    revision: i64,
     snapshot: i64,
     time: f64,
     id: String,
@@ -90,6 +92,22 @@ async fn transcript(pool: &SqlitePool, p: &Value) -> Result<Value, ControlError>
     let id = required(p, "meeting_id")?;
     let meta = get_meeting(pool, id).await?;
     let n = limit(p)?;
+    // Keep revision, rowid boundary and rows in one SQLite read snapshot. A
+    // retranscription replaces rows transactionally and may reuse their rowids.
+    let mut tx = pool.begin().await?;
+    let has_metadata: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meeting_transcription_metadata'")
+        .fetch_one(&mut *tx).await?;
+    let revision: i64 = if has_metadata > 0 {
+        sqlx::query_scalar(
+            "SELECT transcript_revision FROM meeting_transcription_metadata WHERE meeting_id=?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(0)
+    } else {
+        0
+    };
     let c: TranscriptCursor = if let Some(s) = p.get("cursor").filter(|v| !v.is_null()) {
         serde_json::from_str(
             s.as_str()
@@ -101,10 +119,11 @@ async fn transcript(pool: &SqlitePool, p: &Value) -> Result<Value, ControlError>
         let snapshot: i64 =
             sqlx::query_scalar("SELECT COALESCE(MAX(rowid),0) FROM transcripts WHERE meeting_id=?")
                 .bind(id)
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await?;
         TranscriptCursor {
             meeting_id: id.into(),
+            revision,
             snapshot,
             time: -1.0,
             id: String::new(),
@@ -113,7 +132,14 @@ async fn transcript(pool: &SqlitePool, p: &Value) -> Result<Value, ControlError>
     if c.meeting_id != id || c.snapshot < 0 || !c.time.is_finite() {
         return Err(invalid("Cursor does not belong to this meeting"));
     }
-    let rows=sqlx::query("SELECT * FROM transcripts WHERE meeting_id=? AND rowid<=? AND (COALESCE(audio_start_time,0)>? OR (COALESCE(audio_start_time,0)=? AND id>?)) ORDER BY COALESCE(audio_start_time,0),id LIMIT ?").bind(id).bind(c.snapshot).bind(c.time).bind(c.time).bind(&c.id).bind(n+1).fetch_all(pool).await?;
+    if c.revision != revision {
+        return Err(ControlError::new(
+            "conflict",
+            "Transcript changed; restart pagination without a cursor",
+        ));
+    }
+    let rows=sqlx::query("SELECT * FROM transcripts WHERE meeting_id=? AND rowid<=? AND (COALESCE(audio_start_time,0)>? OR (COALESCE(audio_start_time,0)=? AND id>?)) ORDER BY COALESCE(audio_start_time,0),id LIMIT ?").bind(id).bind(c.snapshot).bind(c.time).bind(c.time).bind(&c.id).bind(n+1).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
     let more = rows.len() > n as usize;
     let rows = &rows[..rows.len().min(n as usize)];
     let next = if more {
@@ -121,6 +147,7 @@ async fn transcript(pool: &SqlitePool, p: &Value) -> Result<Value, ControlError>
         Some(
             serde_json::to_string(&TranscriptCursor {
                 meeting_id: id.into(),
+                revision,
                 snapshot: c.snapshot,
                 time: last
                     .get::<Option<f64>, _>("audio_start_time")
@@ -133,7 +160,7 @@ async fn transcript(pool: &SqlitePool, p: &Value) -> Result<Value, ControlError>
         None
     };
     Ok(
-        json!({"meeting_id":id,"items":rows.iter().map(segment).collect::<Vec<_>>(),"next_cursor":next,"partial":meta["state"]!="finalized","snapshot":c.snapshot,"state":meta["state"]}),
+        json!({"meeting_id":id,"items":rows.iter().map(segment).collect::<Vec<_>>(),"next_cursor":next,"partial":meta["state"]!="finalized","snapshot":c.snapshot,"transcript_revision":revision,"state":meta["state"]}),
     )
 }
 #[derive(Serialize, Deserialize)]

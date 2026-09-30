@@ -215,6 +215,46 @@ pub async fn detection_action(
             if current.is_some() {
                 return Err("A recording is already in progress".into());
             }
+            // Restore focus only after the user's Start click, and only if native
+            // evidence is currently inconclusive. Cached audio never authorizes capture.
+            let (application, identity) = {
+                let inner = state
+                    .inner
+                    .lock()
+                    .map_err(|_| "Detection state unavailable")?;
+                let identity = inner.engine.revalidation_identity(&session_id)?;
+                let session = inner
+                    .engine
+                    .sessions()
+                    .into_iter()
+                    .find(|s| s.session_id == session_id)
+                    .ok_or("stale_detection_session")?;
+                if !inner.settings.enabled
+                    || !inner.settings.applications.contains(&session.application)
+                {
+                    return Err("Detection for this application is disabled".into());
+                }
+                (session.application, identity)
+            };
+            log::info!(target:"call_detection","explicit start revalidation session={} app={}",session_id,application);
+            let fresh = tauri::async_runtime::spawn_blocking(move || {
+                call_detection::native::revalidate(&application, &identity, now_ms())
+            })
+            .await
+            .map_err(|e| format!("Could not verify call: {e}"))??;
+            log::info!(target:"call_detection","explicit revalidation session={} state={:?} process={:?} evidence={:?} limitations={:?}",session_id,fresh.state,fresh.process_identity,fresh.evidence,fresh.limitations);
+            {
+                let mut inner = state
+                    .inner
+                    .lock()
+                    .map_err(|_| "Detection state unavailable")?;
+                let settings = inner.settings.clone();
+                let at = now_ms();
+                let accepted =
+                    call_detection::merge_latest_observations(&mut inner.observations, vec![fresh]);
+                inner.engine.update(&accepted, &settings, at);
+                inner.latest_sample_ms = inner.latest_sample_ms.max(at);
+            }
             let application = {
                 let mut inner = state
                     .inner
@@ -314,6 +354,21 @@ async fn apply_observations(app: AppHandle, observations: Vec<Observation>, at: 
         let Ok(mut inner) = state.inner.lock() else {
             return;
         };
+        for observation in &observations {
+            let changed = inner
+                .observations
+                .iter()
+                .find(|o| o.application == observation.application)
+                .map(|prior| {
+                    prior.state != observation.state
+                        || prior.process_identity != observation.process_identity
+                        || prior.limitations != observation.limitations
+                })
+                .unwrap_or(true);
+            if changed {
+                log::info!(target:"call_detection","observation app={} state={:?} process={:?} evidence={:?} limitations={:?}",observation.application,observation.state,observation.process_identity,observation.evidence,observation.limitations);
+            }
+        }
         let current = match recording_result {
             Ok(r) => {
                 inner.error = None;
@@ -336,11 +391,12 @@ async fn apply_observations(app: AppHandle, observations: Vec<Observation>, at: 
             }
         }
         inner.recording = current.clone();
-        inner.observations = observations;
-        inner.latest_sample_ms = at;
+        let accepted =
+            call_detection::merge_latest_observations(&mut inner.observations, observations);
+        inner.latest_sample_ms = inner.latest_sample_ms.max(at);
         let settings = inner.settings.clone();
-        let observations = inner.observations.clone();
-        let mut fresh = inner.engine.update(&observations, &settings, at);
+        let previous_sessions = inner.engine.sessions();
+        let mut fresh = inner.engine.update(&accepted, &settings, at);
         // Any active recording consumes the current session's offer. Its manual stop cannot re-offer.
         if current.is_some() {
             for s in inner.engine.sessions() {
@@ -349,6 +405,16 @@ async fn apply_observations(app: AppHandle, observations: Vec<Observation>, at: 
                 }
             }
             fresh.retain(|p| p.kind != "start");
+        }
+        for session in inner.engine.sessions() {
+            if previous_sessions
+                .iter()
+                .find(|s| s.session_id == session.session_id)
+                .map(|prior| prior.phase != session.phase || prior.suppressed != session.suppressed)
+                .unwrap_or(true)
+            {
+                log::info!(target:"call_detection","session={} phase={:?} suppressed={} starting={} prompts={:?}",session.session_id,session.phase,session.suppressed,session.starting,inner.engine.prompts());
+            }
         }
         (fresh, snapshot(&inner), settings)
     };

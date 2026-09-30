@@ -9,7 +9,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -480,9 +480,17 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
         TranscriptionEngine::Whisper(whisper_engine) => {
             // Get language preference from global state
             let language = crate::get_language_preference_internal();
+            let initial_prompt = {
+                let state = app.try_state::<crate::state::AppState>()
+                    .ok_or_else(|| TranscriptionError::EngineFailed("App state unavailable for vocabulary hints".into()))?;
+                let vocabulary = crate::database::repositories::vocabulary::VocabularyRepository::get_global(
+                    state.db_manager.pool(),
+                ).await.map_err(|error| TranscriptionError::EngineFailed(format!("Unable to load vocabulary hints: {error}")))?;
+                crate::database::repositories::vocabulary::VocabularyRepository::merge(None, vocabulary.as_deref())
+            };
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
+                .transcribe_audio_with_confidence_and_prompt(speech_samples, language, initial_prompt.as_deref())
                 .await
             {
                 Ok((text, confidence, is_partial)) => {
