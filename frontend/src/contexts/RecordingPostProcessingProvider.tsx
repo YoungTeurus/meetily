@@ -1,61 +1,26 @@
 'use client';
-
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useRecordingStop } from '@/hooks/useRecordingStop';
 
-/**
- * RecordingPostProcessingProvider
- *
- * This provider handles post-processing when recording stops from any source:
- * - Tray menu stop
- * - Global keyboard shortcut
- * - Overlay stop button
- * - Main UI stop button
- *
- * It listens for the 'recording-stop-complete' event from Rust backend
- * and triggers the full post-processing flow (save to database, navigate, analytics)
- * regardless of which page the user is currently on.
- */
+export interface MeetingFinalizedEvent { recording_id: string; meeting_id: string; data?: { folder_path?: string } }
+const noOp = () => {};
+/** Native finalization is authoritative regardless of GUI, tray, CLI or detector source. */
 export function RecordingPostProcessingProvider({ children }: { children: React.ReactNode }) {
-  // No-op functions since the global RecordingStateContext already handles state updates
-  // These are only needed for the hook's local component state management
-  const setIsRecording = () => { };
-  const setIsRecordingDisabled = () => { };
-
-  const {
-    handleRecordingStop,
-  } = useRecordingStop(setIsRecording, setIsRecordingDisabled);
-
+  const { handleRecordingStop } = useRecordingStop(noOp, noOp);
+  const handler = useRef(handleRecordingStop);
+  handler.current = handleRecordingStop;
   useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
-
-    const setupListener = async () => {
-      try {
-        // Listen for recording-stop-complete event from Rust
-        unlistenFn = await listen<boolean>('recording-stop-complete', (event) => {
-          console.log('[RecordingPostProcessing] Received recording-stop-complete event:', event.payload);
-
-          // Call the post-processing handler
-          // event.payload is the callApi boolean (true for normal stops)
-          handleRecordingStop(event.payload);
-        });
-
-        console.log('[RecordingPostProcessing] Event listener set up successfully');
-      } catch (error) {
-        console.error('[RecordingPostProcessing] Failed to set up event listener:', error);
-      }
-    };
-
-    setupListener();
-
-    return () => {
-      if (unlistenFn) {
-        console.log('[RecordingPostProcessing] Cleaning up event listener');
-        unlistenFn();
-      }
-    };
-  }, [handleRecordingStop]);
-
+    let active = true;
+    const handled = new Set<string>();
+    const listener = listen<MeetingFinalizedEvent>('meeting.finalized', event => {
+      const { recording_id, meeting_id } = event.payload;
+      if (!active || !recording_id || !meeting_id || handled.has(recording_id)) return;
+      handled.add(recording_id);
+      // Pass the completed meeting explicitly, even when a newer session already exists.
+      void handler.current(true, meeting_id);
+    });
+    return () => { active = false; void listener.then(unlisten => unlisten()); };
+  }, []);
   return <>{children}</>;
 }

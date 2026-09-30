@@ -3,6 +3,8 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { recordingService } from '@/services/recordingService';
 import { toast } from 'sonner';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 
 /**
  * Recording state synchronized with backend
@@ -70,6 +72,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   });
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const currentRecordingId = useRef<string | null>(null);
 
   // NEW: Status setter with logging
   const setStatus = useCallback((status: RecordingStatus, message?: string) => {
@@ -92,6 +95,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
 
       setState(prev => ({
         ...prev,
+        status: backendState.is_recording ? RecordingStatus.RECORDING : prev.status,
         isRecording: backendState.is_recording,
         isPaused: backendState.is_paused,
         isActive: backendState.is_active,
@@ -164,7 +168,13 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
           console.log('[RecordingStateContext] Recording stopped event:', payload);
+          // A delayed event for an older recording cannot stop a newer one.
+          if (payload.recording_id && currentRecordingId.current && payload.recording_id !== currentRecordingId.current) return;
           setState(prev => {
+            if (payload.state === 'finalized') {
+              return { ...prev, status: RecordingStatus.IDLE, statusMessage: undefined,
+                isRecording: false, isPaused: false, isActive: false, recordingDuration: null, activeDuration: null };
+            }
             // Set status to STOPPING if not already in stop flow
             // This ensures smooth UI transition for tray/keyboard stops
             const newStatus = [
@@ -189,6 +199,25 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           stopPolling();
         });
         unsubscribers.push(unlistenStopped);
+
+        const unlistenIdentified = await listen<{ recording_id: string }>('recording.started', event => {
+          currentRecordingId.current = event.payload.recording_id;
+        });
+        unsubscribers.push(unlistenIdentified);
+        const unlistenFinalized = await listen<{ recording_id: string; meeting_id: string }>('meeting.finalized', event => {
+          if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
+          setState(prev => ({ ...prev, status: RecordingStatus.IDLE, statusMessage: undefined,
+            isRecording: false, isPaused: false, isActive: false, recordingDuration: null, activeDuration: null }));
+          stopPolling();
+        });
+        unsubscribers.push(unlistenFinalized);
+        const unlistenRecordingFailed = await listen<{ recording_id: string; data?: { error?: string } }>('recording.failed', event => {
+          if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
+          setState(prev => ({ ...prev, status: RecordingStatus.ERROR, statusMessage: event.payload.data?.error,
+            isRecording: false, isPaused: false, isActive: false }));
+          stopPolling();
+        });
+        unsubscribers.push(unlistenRecordingFailed);
 
         // Recording paused
         const unlistenPaused = await recordingService.onRecordingPaused(() => {
@@ -334,7 +363,12 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    */
   useEffect(() => {
     console.log('[RecordingStateContext] Initial mount - syncing with backend');
-    syncWithBackend();
+    void syncWithBackend();
+    let active = true;
+    void invoke<{ recording: { recording_id: string } | null }>('get_recording_session').then(result => {
+      if (active && !currentRecordingId.current) currentRecordingId.current = result.recording?.recording_id ?? null;
+    }).catch(error => console.error('Could not load recording identity:', error));
+    return () => { active = false; };
   }, []);
 
   // NEW: Computed helpers from status

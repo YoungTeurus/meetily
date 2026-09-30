@@ -30,7 +30,7 @@ pub async fn select_legacy_database_path(app: AppHandle) -> Result<Option<String
     let file_path = app
         .dialog()
         .file()
-        .add_filter("Database Files", &["db"])
+        .add_filter("Database Files", &["db", "sqlite"])
         .blocking_pick_file();
 
     if let Some(path) = file_path {
@@ -53,7 +53,7 @@ pub async fn detect_legacy_database(selected_path: String) -> Result<Option<Stri
     // Case 1: User selected the .db file directly
     if path.is_file() {
         if let Some(extension) = path.extension() {
-            if extension == "db" {
+            if extension == "db" || extension == "sqlite" {
                 info!("Direct .db file selected: {}", selected_path);
                 return Ok(Some(selected_path));
             }

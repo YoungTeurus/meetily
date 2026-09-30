@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["call-detection", "local-control", "meetilyctl"]
 members = [
     "frontend/src-tauri",
     "llama-helper"

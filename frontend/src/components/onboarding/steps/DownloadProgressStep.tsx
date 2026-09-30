@@ -56,7 +56,7 @@ export function DownloadProgressStep() {
 
   const [isCompleting, setIsCompleting] = useState(false);
   const parakeetDownloadStartedRef = useRef(false);
-  const summaryDownloadStartedRef = useRef(false);
+  const [summaryOptIn, setSummaryOptIn] = useState(false);
   const retryingRef = useRef(false);
   const retryingSummaryRef = useRef(false);
 
@@ -184,15 +184,6 @@ export function DownloadProgressStep() {
       }
     });
   }, []);
-
-  // Start the selected summary model only after the backend recommendation is known.
-  useEffect(() => {
-    if (summaryDownloadStartedRef.current) return;
-    if (!selectedSummaryModel) return;
-    summaryDownloadStartedRef.current = true;
-
-    startSummaryDownload();
-  }, [selectedSummaryModel]);
 
   // Listen to Parakeet download progress
   useEffect(() => {
@@ -365,8 +356,7 @@ export function DownloadProgressStep() {
     }
 
     // Check if downloads are complete for toast notification
-    const downloadsComplete = parakeetState.status === 'completed' &&
-      summaryState.status === 'completed';
+    const downloadsComplete = parakeetState.status === 'completed';
 
     // Show toast if downloads still in progress
     if (!downloadsComplete) {
@@ -505,7 +495,11 @@ export function DownloadProgressStep() {
             '~670 MB'
           )}
 
-          {renderDownloadCard(
+          <div className="rounded-md bg-blue-50 p-4 text-sm text-blue-900">
+            <p>Для записи, транскрипта и MCP нужен только движок распознавания. Конспект можно сделать в Codex.</p>
+            {!summaryOptIn && <button type="button" className="mt-2 underline" disabled={!selectedSummaryModel} onClick={() => { setSummaryOptIn(true); void startSummaryDownload(); }}>Скачать необязательный движок конспектов</button>}
+          </div>
+          {summaryOptIn && renderDownloadCard(
             'Summary Engine',
             <Sparkles className="w-5 h-5 text-gray-600" />,
             summaryState,
@@ -516,7 +510,7 @@ export function DownloadProgressStep() {
 
         {/* Info Message - Only show when Parakeet is downloaded */}
         <AnimatePresence>
-          {parakeetDownloaded && !summaryModelDownloaded && (
+          {summaryOptIn && parakeetDownloaded && !summaryModelDownloaded && (
             <motion.div
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
