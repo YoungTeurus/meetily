@@ -12,6 +12,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/build-calls-preview.cjs'
+      - 'scripts/diagnose-windows-native.ps1'
       - '.github/workflows/calls-preview.yml'
       - '.github/*portable*'
 
@@ -79,6 +80,17 @@ jobs:
           pnpm exec tsc --noEmit
       - name: Native tests, desktop package and standalone CLI
         run: node scripts/build-calls-preview.cjs
+      - name: Diagnose Windows native loader failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/diagnose-windows-native.ps1
+      - name: Upload Windows native loader diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.sha }}
+          retention-days: 7
+          path: artifacts/windows-native-diagnostics/
       - name: Upload preview installers and CLI
         uses: actions/upload-artifact@v4
         with:
