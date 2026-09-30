@@ -51,6 +51,7 @@ pub async fn initialize_storage<R: Runtime>(app: &AppHandle<R>) -> Result<(), Co
         .ok_or_else(|| ControlError::new("unavailable", "Complete initial setup in Meetily"))?;
     meetily_local_control::store::initialize(state.db_manager.pool()).await?;
     recording::initialize(app).await?;
+    crate::audio::automatic_retranscription::initialize(app).await?;
     *ready = true;
     Ok(())
 }

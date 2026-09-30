@@ -50,9 +50,32 @@ Teams and browser-specific detection are `unsupported`, not guessed from a proce
 
 ### User preview observation
 
-On 2026-09-30 the user tested the macOS Preview with **Zoom 7.1.9, Russian UI**. A real Zoom call offer appeared; after switching to the compact Meetily window it disappeared with a delay, sometimes allowing a click before it vanished. Screenshots show the offer followed by the empty-offer state. The user reports automatic completion “seems to work.” This is useful real-client feedback, but not a completed end-to-end audio/transcript/permissions acceptance run. The focus/polling regression is being addressed; the detector does not inspect window titles, so a title change has not been established as the cause.
+On 2026-09-30 the user tested the macOS Preview with **Zoom 7.1.9, Russian UI**. A real Zoom call offer appeared; after switching to the compact Meetily window it disappeared with a delay, sometimes allowing a click before it vanished. Screenshots show the offer followed by the empty-offer state. The user reports automatic completion “seems to work.” This is useful real-client feedback, but not a completed end-to-end audio/transcript/permissions acceptance run. The implemented fix retains an offer during transient unknown state, adds enabled Zoom meeting-menu evidence and revalidates an explicit Start. Regression fixtures pass; the new build still needs the user's real-client retest. The detector does not inspect window titles, so a title change has not been established as the cause.
 
 ## Final run results and artifacts
+
+### Codex CLI, automatic retranscription and live notes follow-up
+
+The user confirmed successful manual retranscription in the current macOS Preview and requested Codex CLI inside Generate summary, optional automatic processing after **every** finalized recording, and notes during the call. These additions are implemented in the follow-up tree; the `cb1337e` artifact below does not contain them.
+
+- Full Linux desktop: **274 passed, 0 failed, 3 ignored**, 7.45 seconds (`/tmp/meetily-followup-final-native.log`); final production check passed in 12.81 seconds (`/tmp/meetily-followup-final-production.log`). Includes Codex subprocess failures/timeouts/cancellation/descendant pipes, persisted configuration, shared recording priority and engine exclusion. Nine Codex module tests also passed independently; Apple Silicon and Windows MSVC source checks passed, including the Windows job-object test's compilation.
+- Gateway/storage: **27 passed**, including durable automatic-queue handoff/snapshots/recovery/atomic cancel and four notes persistence/summary-context regressions (`/tmp/meetily-followup-control-tests.log`). Clippy with warnings denied passed.
+- Frontend: **56 top-level tests passed, 0 failed, 198 assertions**, plus isolated component scenarios including notes autosave/conflicts, authoritative recording identity, settings and summary flush ordering. Seven dedicated auto-summary readiness scenarios verify waiting for background processing, failure/cancellation fallback and fail-closed status-query errors. Explicit Generate/Regenerate/Stop consumes deferred automatic intent. TypeScript and the final production Next.js export passed after the coordination change. Logs: `/tmp/meetily-auto-summary-full-ui.log`, `/tmp/meetily-followup-final-next.log`.
+- Actual installed Codex **0.159.0-alpha.3** was run against a localhost fake Responses endpoint. Exactly one request arrived, with **`tools: []`**; the endpoint deliberately returned HTTP 400 to stop execution. This proves tool advertisement for that tested version/configuration, not real-account summary quality. No paid model request or user-authentication changes were performed.
+- Windows resource-link fixture passed: exactly one generated Tauri resource reaches the library test harness and exactly one reaches the production application's linker. Actual MSVC execution and packaging require the next native run.
+- Independent integration review found and prompted fixes for explicit Codex path clearing, native npm executable discovery with Finder's restricted PATH, and automatic-processing admission. No remaining concrete P1/P2 finding at handoff to native CI.
+
+Automatic processing remains cooperative at native audio-fragment boundaries: recording start waits up to 30 seconds, then returns a retryable `audio_busy` error if the current native operation has not yielded. Real logged-in Codex summary generation, after-call inference and live notes with physical audio remain local acceptance checks.
+
+### Current native preview
+
+[Native CI run 36735969234](https://github.com/YoungTeurus/meetily/actions/runs/36735969234) builds implementation **`cb1337e2d8345f6ff56957468b9ce2ae70857cde`**, with PR merge checkout **`e103c880251701f4c0d47e1231cb122a8a025b55`**. Later documentation-only commits do not change this tested implementation.
+
+- **macOS ARM64: succeeded.** Native desktop tests: **264 passed, 0 failed, 4 ignored** (9.20 seconds). Gateway/storage 19, detector 30, CLI/MCP 17 passed. Frontend tests and types passed. Release `.app`, DMG and standalone CLI built.
+- [Download macOS DMG and CLI archive](https://github.com/YoungTeurus/meetily/actions/runs/36735969234/artifacts/11108266151), 51,322,358 bytes, expires **2026-10-14**. GitHub archive SHA256: `be2b236ced072c57fd7db7d1bbeb39688d526c8d022cdd717f0f5de16f0c77f6`.
+- **Windows x64 native tests: succeeded**, desktop **264 passed, 0 failed, 3 ignored** (20.15 seconds), including sequential/concurrent device enumeration after caller teardown; gateway/storage 19, detector 30 and CLI/MCP 17 passed. Release linking then failed with `CVT1100: duplicate resource, type VERSION, name 1` and `LNK1123`. No installer was produced by this run. The follow-up patch links the Tauri resource only into the library test harness; the production application retains Tauri's sole resource argument. Cross-target linker-argument fixtures pass; native packaging must be rerun.
+
+These are Preview artifacts, not a published release: macOS has an ad-hoc signature only, with no Developer ID/notarization; Windows packages have no publisher signature. Successful native CI proves compilation, automated tests and packaging, not installation on the minimum OS or real Zoom/Discord audio/notification behavior. See the [physical acceptance checklist](../CALLS_PREVIEW.ru.md#ручная-приёмка-на-обеих-ос).
 
 ### Preview feedback follow-up
 
@@ -60,7 +83,7 @@ On 2026-09-30 the user tested the macOS Preview with **Zoom 7.1.9, Russian UI**.
 - Gateway/storage: **19 passed**, including five new vocabulary/replacement transaction cases and a transcript cursor regression. The regression first reproduced mixed old/new pages after SQLite reused rowids; cursors now bind a transcript revision and rows/revision are read in one SQLite snapshot. Clippy with warnings denied passed.
 - CLI/MCP: **17 passed** after the storage change; the stable exit-code test also passed after mapping new `audio_busy` conflicts to exit 6. Detector policy/native evidence fixtures: **30 passed**, with Apple Silicon and Windows source checks passed.
 - Frontend: **50 top-level tests passed**, with all **30 isolated component scenarios** executed, including 17 retranscription/recovery scenarios (60 child assertions). TypeScript passed. Review fixes cover hidden-dialog completion, terminal status recovery with retained warnings, page refresh, and model readiness commands that can implicitly load an engine.
-- CPAL 0.15.3 is patched at its root cause with thread-local Windows enumeration, preserving version and dependency graph; Linux and Windows MSVC source checks passed. Actual Windows runtime regression and new installers require the follow-up native CI run.
+- CPAL 0.15.3 is patched at its root cause with thread-local Windows enumeration, preserving version and dependency graph; Linux and Windows MSVC source checks passed. Native run 36735969234 subsequently passed the actual Windows runtime regression. Windows packaging remains a separate linker-resource issue, described above.
 - Whisper prompt tokenization and native API integration compile against the actual locked engine; helper tests cover Unicode, empty prompts, ordering, cap and tokenizer errors. No model inference or accuracy comparison on the user's recorded audio has been executed in this cloud.
 
 ### Initial implementation and native build history

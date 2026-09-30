@@ -76,6 +76,8 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     #[serde(rename = "ollamaEndpoint")]
     pub ollama_endpoint: Option<String>,
+    #[serde(rename = "codexBinaryPath", default)]
+    pub codex_binary_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,6 +90,8 @@ pub struct SaveModelConfigRequest {
     pub api_key: Option<String>,
     #[serde(rename = "ollamaEndpoint")]
     pub ollama_endpoint: Option<String>,
+    #[serde(rename = "codexBinaryPath", default)]
+    pub codex_binary_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -464,6 +468,19 @@ pub async fn api_update_profile<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn api_check_codex_cli(
+    state: tauri::State<'_, AppState>,
+    binary_path: Option<String>,
+) -> Result<crate::summary::codex_cli::CodexCliStatus, String> {
+    let path = match binary_path {
+        Some(path) => Some(path),
+        None => SettingsRepository::get_model_config(state.db_manager.pool()).await
+            .map_err(|e| e.to_string())?.and_then(|config| config.codex_binary_path),
+    };
+    Ok(crate::summary::codex_cli::inspect(path.as_deref()).await)
+}
+
+#[tauri::command]
 pub async fn api_get_model_config<R: Runtime>(
     _app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
@@ -490,6 +507,7 @@ pub async fn api_get_model_config<R: Runtime>(
                         whisper_model: config.whisper_model,
                         api_key,
                         ollama_endpoint: config.ollama_endpoint,
+                        codex_binary_path: config.codex_binary_path,
                     }))
                 }
                 Err(e) => {
@@ -522,6 +540,7 @@ pub async fn api_save_model_config<R: Runtime>(
     whisper_model: String,
     api_key: Option<String>,
     ollama_endpoint: Option<String>,
+    codex_binary_path: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -533,12 +552,13 @@ pub async fn api_save_model_config<R: Runtime>(
     );
     let pool = state.db_manager.pool();
 
-    if let Err(e) = SettingsRepository::save_model_config(
+    if let Err(e) = SettingsRepository::save_model_config_with_codex(
         pool,
         &provider,
         &model,
         &whisper_model,
         ollama_endpoint.as_deref(),
+        codex_binary_path.as_deref(),
     )
     .await
     {

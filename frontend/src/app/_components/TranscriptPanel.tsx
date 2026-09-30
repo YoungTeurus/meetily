@@ -1,3 +1,4 @@
+import { MeetingNotes } from '@/components/MeetingNotes';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { PermissionWarning } from '@/components/PermissionWarning';
 import { Button } from '@/components/ui/button';
@@ -33,7 +34,7 @@ export function TranscriptPanel({
   // Contexts
   const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
-  const { isRecording, isPaused } = useRecordingState();
+  const { isRecording, isPaused, meetingId } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
 
@@ -100,6 +101,8 @@ export function TranscriptPanel({
           />
         </div>
       )}
+
+      {meetingId && <MeetingNotes meetingId={meetingId} recording={isRecording} />}
 
       {/* Transcript content */}
       <div className="pb-20">

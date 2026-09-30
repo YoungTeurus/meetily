@@ -274,9 +274,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
           setModelConfig(prev => ({
             ...prev,
             provider: data.provider,
-            model: data.model || prev.model,
+            model: data.provider === 'codex-cli' ? (data.model ?? '') : (data.model || prev.model),
             whisperModel: data.whisperModel || prev.whisperModel,
             ollamaEndpoint: data.ollamaEndpoint,
+            codexBinaryPath: data.codexBinaryPath,
           }));
 
           // Seed per-provider model cache from DB
@@ -355,6 +356,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
     'builtin-ai': [],
     'custom-openai': [],
+    'codex-cli': [],
   };
 
   // Toggle confidence indicator with localStorage persistence

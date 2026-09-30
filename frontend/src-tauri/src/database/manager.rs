@@ -158,7 +158,7 @@ impl DatabaseManager {
         }
         let backup = app_data_dir.join(format!("import-backup-{}.sqlite", uuid::Uuid::new_v4()));
         meetily_local_control::import::snapshot_for_import(
-            Path::new(legacy_db_path), &backup, 20260930000000,
+            Path::new(legacy_db_path), &backup, 20260930030000,
         ).await.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         fs::copy(&backup, &target_legacy_path).map_err(sqlx::Error::Io)?;
 

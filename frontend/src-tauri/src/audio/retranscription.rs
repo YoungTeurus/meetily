@@ -27,6 +27,7 @@ static JOB: Mutex<Option<RetranscriptionJob>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RetranscriptionJob {
+    pub automatic: bool,
     pub job_id: String,
     pub meeting_id: String,
     pub state: String,
@@ -607,9 +608,20 @@ async fn run_retranscription<R: Runtime>(
         .collect();
     let metadata = {
         let _summary_guard = crate::summary::commands::SUMMARY_START_LOCK.lock().await;
-        retranscription_store::replace(app_state.db_manager.pool(), &meeting_id, &replacement)
-            .await
-            .map_err(|e| anyhow!(e))?
+        let automatic_id = JOB
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|j| j.automatic)
+            .map(|j| j.job_id.clone());
+        retranscription_store::replace_for_job(
+            app_state.db_manager.pool(),
+            &meeting_id,
+            &replacement,
+            automatic_id.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow!(e))?
     };
     let mut warnings = Vec::new();
 
@@ -703,6 +715,10 @@ async fn get_or_init_whisper<R: Runtime>(
     requested_model: Option<&str>,
 ) -> Result<Arc<WhisperEngine>> {
     use crate::whisper_engine::commands::WHISPER_ENGINE;
+    // A recovered automatic queue can run before the background startup initializer.
+    crate::whisper_engine::commands::whisper_init()
+        .await
+        .map_err(|e| anyhow!(e))?;
 
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -821,6 +837,9 @@ async fn get_or_init_parakeet<R: Runtime>(
     requested_model: Option<&str>,
 ) -> Result<Arc<ParakeetEngine>> {
     use crate::parakeet_engine::commands::PARAKEET_ENGINE;
+    crate::parakeet_engine::commands::parakeet_init()
+        .await
+        .map_err(|e| anyhow!(e))?;
 
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1038,9 +1057,11 @@ pub async fn start_retranscription_command<R: Runtime>(
             .await
             .map_err(|e| e.to_string())?
     };
+    super::automatic_retranscription_store::supersede(state.db_manager.pool(), &meeting_id).await?;
     let initial_prompt = VocabularyRepository::merge(run_hints.as_deref(), global.as_deref());
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
     *JOB.lock().unwrap() = Some(RetranscriptionJob {
+        automatic: false,
         job_id: job_id.clone(),
         meeting_id: meeting_id.clone(),
         state: "running".into(),
@@ -1085,7 +1106,11 @@ pub async fn start_retranscription_command<R: Runtime>(
 pub async fn cancel_retranscription_command(job_id: String) -> Result<(), String> {
     let job = JOB.lock().unwrap();
     let job = job.as_ref().ok_or("No retranscription in progress")?;
-    job.request_cancel(&job_id, &RETRANSCRIPTION_CANCELLED)
+    job.request_cancel(&job_id, &RETRANSCRIPTION_CANCELLED)?;
+    if job.automatic {
+        super::automatic_retranscription::mark_user_cancelled();
+    }
+    Ok(())
 }
 #[tauri::command]
 pub async fn get_retranscription_status_command(meeting_id: Option<String>) -> serde_json::Value {
@@ -1141,6 +1166,7 @@ mod tests {
 
     fn local_job() -> RetranscriptionJob {
         RetranscriptionJob {
+            automatic: false,
             job_id: "current".into(),
             meeting_id: "m".into(),
             state: "running".into(),
@@ -1409,4 +1435,75 @@ mod tests {
         assert_eq!(metadata["custom_field"], "preserve me");
         assert!(metadata.get("detected_summary_language").is_none());
     }
+}
+
+/// Used only by the durable queue while holding the recorder's batch reservation.
+pub(crate) async fn execute_automatic<R: Runtime>(
+    app: AppHandle<R>,
+    job: &super::automatic_retranscription_store::Job,
+) -> Result<RetranscriptionResult, String> {
+    let guard = RetranscriptionGuard::acquire()?;
+    let state = app
+        .try_state::<AppState>()
+        .ok_or("Database not initialized")?;
+    let (folder, started_at) =
+        retranscription_store::source(state.db_manager.pool(), &job.meeting_id).await?;
+    find_audio_file(Path::new(&folder)).map_err(|e| e.to_string())?;
+    let config: super::automatic_retranscription_store::Settings =
+        serde_json::from_value(job.config.clone()).map_err(|e| e.to_string())?;
+    let language = (config.language != "auto").then_some(config.language);
+    let hints = job
+        .config
+        .get("vocabulary")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    *JOB.lock().unwrap() = Some(RetranscriptionJob {
+        automatic: true,
+        job_id: job.job_id.clone(),
+        meeting_id: job.meeting_id.clone(),
+        state: "running".into(),
+        stage: "queued".into(),
+        progress_percentage: 0,
+        message: "Preparing saved audio automatically".into(),
+        error: None,
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        language: language.clone(),
+        vocabulary_terms: None,
+        effective_vocabulary: hints.clone(),
+        result: None,
+    });
+    let still_running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM automatic_retranscription_jobs WHERE job_id=? AND state='running'",
+    )
+    .bind(&job.job_id)
+    .fetch_one(state.db_manager.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+    if super::automatic_retranscription::was_preempted() || still_running == 0 {
+        preempt_automatic();
+    }
+    start_retranscription(
+        guard,
+        app,
+        job.meeting_id.clone(),
+        folder,
+        language,
+        Some(config.model),
+        Some(config.provider),
+        hints,
+        started_at,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+/// Saving is deliberately not cancellable; callers can wait for that short boundary.
+pub(crate) fn preempt_automatic() -> bool {
+    let job = JOB.lock().unwrap();
+    job.as_ref().is_some_and(|j| {
+        j.automatic
+            && j.request_cancel(&j.job_id, &RETRANSCRIPTION_CANCELLED)
+                .is_ok()
+    })
 }

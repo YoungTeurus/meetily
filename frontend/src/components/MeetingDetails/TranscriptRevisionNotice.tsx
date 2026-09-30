@@ -14,13 +14,16 @@ export function TranscriptRevisionNotice({ meetingId, summaryStatus }: { meeting
       try { const result = await retranscriptionService.getInfo(meetingId); if (active && version === request) { setInfo(result); setError(''); } }
       catch (cause) { if (active && version === request) setError(`Не удалось проверить, соответствует ли конспект текущему тексту: ${String(cause)}`); }
     };
-    const listener = listen<{ meeting_id: string; transcript_revision: number; summary_stale: boolean }>('retranscription-complete', event => {
+    const transcriptListener = listen<{ meeting_id: string; transcript_revision: number; summary_stale: boolean }>('retranscription-complete', event => {
       if (active && event.payload.meeting_id === meetingId) { setInfo(event.payload); void refresh(); }
     });
+    const listener = Promise.all([transcriptListener, listen<{ meeting_id: string }>('meeting-notes-updated', event => {
+      if (active && event.payload.meeting_id === meetingId) void refresh();
+    })]);
     void listener.then(refresh).catch(cause => { if (active) setError(String(cause)); });
-    return () => { active = false; void listener.then(unsubscribe => unsubscribe()).catch(() => {}); };
+    return () => { active = false; void listener.then(unsubscribes => unsubscribes.forEach(unsubscribe => unsubscribe())).catch(() => {}); };
   }, [meetingId, summaryStatus]);
   if (error) return <p role="alert" className="border-b bg-amber-50 px-5 py-3 text-sm text-amber-900">{error}</p>;
   if (!info?.summary_stale) return null;
-  return <p role="status" className="border-b bg-amber-50 px-5 py-3 text-sm text-amber-900">Транскрипт распознан заново. Сохранённый конспект относится к прежнему тексту. Обновите конспект отдельно, если нужно.</p>;
+  return <p role="status" className="border-b bg-amber-50 px-5 py-3 text-sm text-amber-900">Транскрипт или заметки изменились. Сохранённый конспект относится к прежним данным. Сгенерируйте его заново, чтобы учесть изменения.</p>;
 }

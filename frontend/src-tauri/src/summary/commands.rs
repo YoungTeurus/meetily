@@ -1,5 +1,6 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository,
+    notes::{NotesRepository, with_summary_notes},
     summary::SummaryProcessesRepository, transcript_chunk::TranscriptChunksRepository,
 };
 use crate::state::AppState;
@@ -503,6 +504,12 @@ pub async fn api_process_transcript<R: Runtime>(
         if segments.is_empty() { return Err("Meeting has no saved transcript to summarize".into()); }
         segments.join("\n")
     } else { text };
+    // User notes are additional context, not recognized speech. Loading under
+    // the shared boundary prevents a save from racing this summary snapshot.
+    let final_prompt = if existing_meeting {
+        let notes = NotesRepository::get(&pool, &m_id).await.map_err(|e| e.message)?;
+        with_summary_notes(&final_prompt, &notes.notes)
+    } else { final_prompt };
     let started_at = next_summary_start(Utc::now());
     SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, started_at)
         .await

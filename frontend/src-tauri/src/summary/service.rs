@@ -351,7 +351,7 @@ impl SummaryService {
         );
 
         // Parse provider
-        let provider = match LLMProvider::from_str(&model_provider) {
+        let mut provider = match LLMProvider::from_str(&model_provider) {
             Ok(p) => p,
             Err(e) => {
                 Self::fail_and_cleanup(&pool, &meeting_id, started_at, &e).await;
@@ -359,8 +359,18 @@ impl SummaryService {
             }
         };
 
+        if let LLMProvider::CodexCli { binary_path } = &mut provider {
+            match SettingsRepository::get_model_config(&pool).await {
+                Ok(config) => *binary_path = config.and_then(|c| c.codex_binary_path).map(std::path::PathBuf::from),
+                Err(error) => {
+                    Self::fail_and_cleanup(&pool, &meeting_id, started_at, &format!("Failed to load Codex CLI settings: {error}")).await;
+                    return;
+                }
+            }
+        }
+
         // Validate and setup api_key, Flexible for Ollama, BuiltInAI, and CustomOpenAI
-        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI {
+        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI || matches!(provider, LLMProvider::CodexCli { .. }) {
             // These providers don't require API keys from the standard database column
             String::new()
         } else {

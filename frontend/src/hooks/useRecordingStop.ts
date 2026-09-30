@@ -1,3 +1,4 @@
+import { meetingNotesService } from '@/services/meetingNotesService';
 import { useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { invoke } from '@tauri-apps/api/core';
@@ -50,6 +51,10 @@ export function useRecordingStop(
       }
       if (handledMeetingRef.current === meetingId) return;
       handledMeetingRef.current = meetingId;
+      // A notes failure must not turn a successfully finalized recording into an error.
+      try { await meetingNotesService.flush(meetingId); } catch {
+        toast.error('Meeting notes were not saved. Your draft is retained; retry on the meeting page.');
+      }
       const meeting = await storageService.getMeeting(meetingId);
       try {
         if (!(await applyPinnedSummaryLanguageToMeeting(meetingId))) {

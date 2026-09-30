@@ -89,7 +89,7 @@ function MeetingDetailsContent() {
       const currentConfig = await invoke('api_get_model_config') as any;
 
       // If DB already has a model, use it (never override!)
-      if (currentConfig && currentConfig.model) {
+      if (currentConfig && (currentConfig.provider === 'codex-cli' || currentConfig.model)) {
         console.log('Using existing model from DB:', currentConfig.model);
         setShouldAutoGenerate(true);
         setHasCheckedAutoGen(true);

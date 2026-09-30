@@ -23,7 +23,24 @@ static PENDING: Mutex<Vec<TranscriptUpdate>> = Mutex::new(Vec::new());
 static DRAINED: Mutex<Option<Option<String>>> = Mutex::new(None);
 static CAPTURE_FOLDER: Mutex<Option<String>> = Mutex::new(None);
 static FILE_DIRTY: Mutex<bool> = Mutex::new(false);
-static BATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct StartPriority;
+impl Drop for StartPriority {
+    fn drop(&mut self) {
+        PENDING_STARTS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub(crate) fn has_pending_start() -> bool {
+    PENDING_STARTS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+pub(crate) fn reserve_automatic_batch() -> Result<BatchGuard, String> {
+    if has_pending_start() {
+        return Err("A recording start has priority".into());
+    }
+    reserve_batch_kind(true)
+}
+// One atomic snapshot distinguishes idle, manual batch, and automatic batch.
+static BATCH_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn is_active() -> bool {
     active().is_some()
@@ -36,17 +53,23 @@ pub(crate) struct BatchGuard {
 }
 impl Drop for BatchGuard {
     fn drop(&mut self) {
-        BATCH_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        BATCH_KIND.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }
 pub(crate) fn reserve_batch() -> Result<BatchGuard, String> {
+    reserve_batch_kind(false)
+}
+fn reserve_batch_kind(automatic: bool) -> Result<BatchGuard, String> {
     let guard = TRANSITION
         .try_lock()
         .map_err(|_| "Recording or another audio operation is in progress".to_string())?;
     if is_active() {
         return Err("Stop the active recording before processing saved audio".into());
     }
-    BATCH_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    BATCH_KIND.store(
+        if automatic { 2 } else { 1 },
+        std::sync::atomic::Ordering::SeqCst,
+    );
     Ok(BatchGuard { _transition: guard })
 }
 
@@ -195,13 +218,29 @@ async fn dispatch_inner<R: Runtime>(
     if method == "recording.status" || method == "status" {
         return session_status(&app, &params).await;
     }
-    if method == "recording.start" && BATCH_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(ControlError::new(
-            "audio_busy",
-            "Saved audio is being processed; wait or cancel that job before recording",
-        ));
+    let _start_priority = if method == "recording.start" {
+        PENDING_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(StartPriority)
+    } else {
+        None
+    };
+    let batch_kind = BATCH_KIND.load(std::sync::atomic::Ordering::SeqCst);
+    let automatic = batch_kind == 2;
+    if method == "recording.start" && batch_kind != 0 {
+        if automatic {
+            crate::audio::automatic_retranscription::preempt_for_recording();
+        } else {
+            return Err(ControlError::new(
+                "audio_busy",
+                "Saved audio is being processed; wait or cancel that job before recording",
+            ));
+        }
     }
-    let _guard = TRANSITION.lock().await;
+    let _guard = if method == "recording.start" && automatic {
+        tokio::time::timeout(std::time::Duration::from_secs(30),TRANSITION.lock()).await.map_err(|_|ControlError::new("audio_busy","Automatic retranscription is stopping after its current audio chunk. Please retry recording shortly."))?
+    } else {
+        TRANSITION.lock().await
+    };
     let pool = db(&app)?;
     persistence::initialize(&pool).await.map_err(db_error)?;
     match method {

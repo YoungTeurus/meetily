@@ -24,7 +24,7 @@ const invoke = mock(async (command: string, args?: Record<string, unknown>): Pro
   throw new Error(command);
 });
 mock.module('@tauri-apps/api/core', () => ({ ...core, invoke }));
-mock.module('@tauri-apps/api/event', () => ({ ...events, listen: async (name: string, handler: (event: { payload: any }) => void) => { handlers.set(name, handler); return () => handlers.delete(name); } }));
+mock.module('@tauri-apps/api/event', () => ({ ...events, listen: async (name: string, handler: (event: { payload: any }) => void) => { handlers.set(name, handler); return () => { if (handlers.get(name) === handler) handlers.delete(name); }; } }));
 mock.module('../../src/contexts/ConfigContext', () => ({ ...originalConfig, useConfig: () => ({ selectedLanguage: 'ru', transcriptModelConfig: { provider: 'localWhisper', model: 'base' } }) }));
 mock.module('next/navigation', () => ({ useRouter: () => ({ push: () => {} }) }));
 mock.module('sonner', () => ({ toast: { success: () => {}, error: () => {}, warning } }));
@@ -159,7 +159,11 @@ describe('Safe retranscription and vocabulary UI', () => {
     vocabularyFailure = false; await click('Загрузить подсказки ещё раз'); expect(renderer!.root.findByProps({ 'aria-label': 'Общие подсказки' }).props.value).toBe('HRMS, Гермес');
   });
   test('stale summary notice persists after a reload and clears when backend confirms a new summary', async () => {
-    await mount(<TranscriptRevisionNotice meetingId="meeting-1" summaryStatus="idle" />); expect(JSON.stringify(renderer!.toJSON())).toContain('Сохранённый конспект относится к прежнему тексту');
+    await mount(<TranscriptRevisionNotice meetingId="meeting-1" summaryStatus="idle" />); expect(JSON.stringify(renderer!.toJSON())).toContain('Сохранённый конспект относится к прежним данным');
     stale = false; await act(async () => { renderer!.update(<TranscriptRevisionNotice meetingId="meeting-1" summaryStatus="completed" />); }); expect(renderer!.toJSON()).toBeNull();
+    stale = true;
+    await emit('meeting-notes-updated', { meeting_id: 'other-meeting', revision: 1 }); expect(renderer!.toJSON()).toBeNull();
+    await emit('meeting-notes-updated', { meeting_id: 'meeting-1', revision: 1 });
+    expect(JSON.stringify(renderer!.toJSON())).toContain('Транскрипт или заметки изменились');
   });
 });

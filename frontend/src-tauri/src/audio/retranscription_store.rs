@@ -72,6 +72,14 @@ pub async fn replace(
     meeting_id: &str,
     segments: &[ReplacementSegment],
 ) -> Result<TranscriptionInfo, String> {
+    replace_for_job(pool, meeting_id, segments, None).await
+}
+pub async fn replace_for_job(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    segments: &[ReplacementSegment],
+    automatic_job_id: Option<&str>,
+) -> Result<TranscriptionInfo, String> {
     if segments.is_empty() || segments.iter().all(|s| s.text.trim().is_empty()) {
         return Err("No transcript was produced; existing transcript was kept".into());
     }
@@ -111,6 +119,13 @@ pub async fn replace(
         transcript_revision: row.get("transcript_revision"),
         summary_stale: row.get::<i64, _>("summary_stale") != 0,
     };
+    if let Some(job_id) = automatic_job_id {
+        let updated = sqlx::query("UPDATE automatic_retranscription_jobs SET state='completed',result=?,error=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=? AND meeting_id=? AND state='running'")
+            .bind(serde_json::to_string(&result).map_err(|e|e.to_string())?).bind(job_id).bind(meeting_id).execute(&mut *tx).await.map_err(|e|e.to_string())?.rows_affected();
+        if updated != 1 {
+            return Err("Automatic retranscription no longer owns this job".into());
+        }
+    }
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(result)
 }

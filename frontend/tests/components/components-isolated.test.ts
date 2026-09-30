@@ -9,9 +9,12 @@ import { fileURLToPath } from 'node:url';
 const fixtures = [
   ['call-prompts', 6],
   ['recording-finalized', 3],
-  ['recording-state-finalized', 2],
+  ['recording-state-finalized', 5],
   ['onboarding-database-choice', 4],
   ['retranscription-ui', 17],
+  ['feature-settings', 7],
+  ['meeting-notes', 8],
+  ['automatic-summary', 7],
 ] as const;
 
 for (const [name, assertions] of fixtures) {

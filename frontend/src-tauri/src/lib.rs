@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
+
+// Tauri links application resources to binaries; the library test harness also
+// needs the Common Controls v6 manifest, but production targets must link it once.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+mod windows_test_resource;
+
 // Removed unused import
 
 // Performance optimization: Conditional logging macros for hot paths
@@ -748,6 +754,7 @@ pub fn run() {
             api::api_save_profile,
             api::api_update_profile,
             api::api_get_model_config,
+            api::api_check_codex_cli,
             api::api_save_model_config,
             api::api_get_api_key,
             // api::api_get_auto_generate_setting,
@@ -860,6 +867,12 @@ pub fn run() {
             audio::retranscription::get_whisper_vocabulary,
             audio::retranscription::save_global_whisper_vocabulary,
             audio::retranscription::get_meeting_transcription_info,
+            database::notes_commands::get_meeting_notes,
+            database::notes_commands::save_meeting_notes,
+            audio::automatic_retranscription::get_automatic_retranscription_settings,
+            audio::automatic_retranscription::set_automatic_retranscription_settings,
+            audio::automatic_retranscription::get_automatic_retranscription_status,
+            audio::automatic_retranscription::cancel_automatic_retranscription,
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,

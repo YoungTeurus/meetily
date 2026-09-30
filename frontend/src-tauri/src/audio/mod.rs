@@ -47,6 +47,8 @@ pub mod constants;
 
 // Retranscription module (re-process stored audio with different settings)
 pub mod retranscription;
+pub mod automatic_retranscription;
+pub(crate) mod automatic_retranscription_store;
 pub(crate) mod retranscription_store;
 
 // Import module (import external audio files as new meetings)

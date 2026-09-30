@@ -28,6 +28,7 @@ export enum RecordingStatus {
 }
 
 interface RecordingState {
+  meetingId: string | null; // Durable native identity, retained through stop for notes flushing
   isRecording: boolean;           // Is a recording session active
   isPaused: boolean;              // Is the recording paused
   isActive: boolean;              // Is actively recording (recording && !paused)
@@ -62,6 +63,7 @@ export const useRecordingState = () => {
 
 export function RecordingStateProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<RecordingState>({
+    meetingId: null,
     isRecording: false,
     isPaused: false,
     isActive: false,
@@ -139,9 +141,28 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   useEffect(() => {
     console.log('[RecordingStateContext] Setting up event listeners');
     const unsubscribers: (() => void)[] = [];
+    let active = true;
+    const register = (unsubscribe: () => void) => {
+      if (active) unsubscribers.push(unsubscribe); else unsubscribe();
+    };
 
     const setupListeners = async () => {
       try {
+        const unlistenIdentified = await listen<{ recording_id: string; meeting_id: string }>('recording:started', event => {
+          if (!active) return;
+          currentRecordingId.current = event.payload.recording_id;
+          setState(prev => ({ ...prev, meetingId: event.payload.meeting_id }));
+        });
+        register(unlistenIdentified);
+        if (!active) return;
+        // Register identity first, then hydrate; a newer event always wins the read race.
+        void invoke<{ recording: { recording_id: string; meeting_id: string } | null }>('get_recording_session').then(result => {
+          if (active && !currentRecordingId.current) {
+            currentRecordingId.current = result.recording?.recording_id ?? null;
+            setState(prev => ({ ...prev, meetingId: result.recording?.meeting_id ?? null }));
+          }
+        }).catch(error => console.error('Could not load recording identity:', error));
+
         // Recording started
         const unlistenStarted = await recordingService.onRecordingStarted(() => {
           console.log('[RecordingStateContext] Recording started event');
@@ -154,16 +175,16 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           }));
           startPolling();
         });
-        unsubscribers.push(unlistenStarted);
+        register(unlistenStarted);
 
         // Recording starting (startup in progress)
         const unlistenStarting = await recordingService.onRecordingStarting(() => {
           console.log('[RecordingStateContext] Recording starting event');
           setState(prev => prev.status === RecordingStatus.RECORDING
             ? prev
-            : { ...prev, status: RecordingStatus.STARTING, statusMessage: 'Starting recording...' });
+            : { ...prev, meetingId: null, status: RecordingStatus.STARTING, statusMessage: 'Starting recording...' });
         });
-        unsubscribers.push(unlistenStarting);
+        register(unlistenStarting);
 
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
@@ -198,26 +219,22 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           });
           stopPolling();
         });
-        unsubscribers.push(unlistenStopped);
+        register(unlistenStopped);
 
-        const unlistenIdentified = await listen<{ recording_id: string }>('recording:started', event => {
-          currentRecordingId.current = event.payload.recording_id;
-        });
-        unsubscribers.push(unlistenIdentified);
         const unlistenFinalized = await listen<{ recording_id: string; meeting_id: string }>('meeting:finalized', event => {
           if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
           setState(prev => ({ ...prev, status: RecordingStatus.IDLE, statusMessage: undefined,
             isRecording: false, isPaused: false, isActive: false, recordingDuration: null, activeDuration: null }));
           stopPolling();
         });
-        unsubscribers.push(unlistenFinalized);
+        register(unlistenFinalized);
         const unlistenRecordingFailed = await listen<{ recording_id: string; data?: { error?: string } }>('recording:failed', event => {
           if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
           setState(prev => ({ ...prev, status: RecordingStatus.ERROR, statusMessage: event.payload.data?.error,
             isRecording: false, isPaused: false, isActive: false }));
           stopPolling();
         });
-        unsubscribers.push(unlistenRecordingFailed);
+        register(unlistenRecordingFailed);
 
         // Recording paused
         const unlistenPaused = await recordingService.onRecordingPaused(() => {
@@ -228,7 +245,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: false,
           }));
         });
-        unsubscribers.push(unlistenPaused);
+        register(unlistenPaused);
 
         // Recording resumed
         const unlistenResumed = await recordingService.onRecordingResumed(() => {
@@ -239,7 +256,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: true,
           }));
         });
-        unsubscribers.push(unlistenResumed);
+        register(unlistenResumed);
 
         console.log('[RecordingStateContext] Event listeners set up successfully');
       } catch (error) {
@@ -250,6 +267,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     setupListeners();
 
     return () => {
+      active = false;
       console.log('[RecordingStateContext] Cleaning up event listeners');
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
@@ -364,11 +382,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   useEffect(() => {
     console.log('[RecordingStateContext] Initial mount - syncing with backend');
     void syncWithBackend();
-    let active = true;
-    void invoke<{ recording: { recording_id: string } | null }>('get_recording_session').then(result => {
-      if (active && !currentRecordingId.current) currentRecordingId.current = result.recording?.recording_id ?? null;
-    }).catch(error => console.error('Could not load recording identity:', error));
-    return () => { active = false; };
+
   }, []);
 
   // NEW: Computed helpers from status

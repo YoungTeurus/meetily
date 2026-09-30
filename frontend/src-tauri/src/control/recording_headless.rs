@@ -128,10 +128,22 @@ async fn gui_cli_mcp_share_one_capture_and_finish_tails_after_caller_cancellatio
 
     // GUI capture is held during warmup while CLI and MCP submit competing
     // starts through the same public dispatch used by their gateway requests.
+    // Automatic offline work must yield this same boundary to a new recording.
+    let automatic_batch = reserve_automatic_batch().unwrap();
     let gui_app = app.clone();
     let gui = tokio::spawn(async move {
         audio::start_recording_with_meeting_name(gui_app, Some("GUI call".into())).await
     });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !has_pending_start() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recorder.starts.load(Ordering::SeqCst), 0);
+    assert!(reserve_automatic_batch().is_err());
+    drop(automatic_batch);
     await_boundary(&recorder.start_entered).await;
     let cli_app = app.clone();
     let mcp_app = app.clone();
