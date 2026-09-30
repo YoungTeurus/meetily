@@ -200,18 +200,18 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         });
         unsubscribers.push(unlistenStopped);
 
-        const unlistenIdentified = await listen<{ recording_id: string }>('recording.started', event => {
+        const unlistenIdentified = await listen<{ recording_id: string }>('recording:started', event => {
           currentRecordingId.current = event.payload.recording_id;
         });
         unsubscribers.push(unlistenIdentified);
-        const unlistenFinalized = await listen<{ recording_id: string; meeting_id: string }>('meeting.finalized', event => {
+        const unlistenFinalized = await listen<{ recording_id: string; meeting_id: string }>('meeting:finalized', event => {
           if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
           setState(prev => ({ ...prev, status: RecordingStatus.IDLE, statusMessage: undefined,
             isRecording: false, isPaused: false, isActive: false, recordingDuration: null, activeDuration: null }));
           stopPolling();
         });
         unsubscribers.push(unlistenFinalized);
-        const unlistenRecordingFailed = await listen<{ recording_id: string; data?: { error?: string } }>('recording.failed', event => {
+        const unlistenRecordingFailed = await listen<{ recording_id: string; data?: { error?: string } }>('recording:failed', event => {
           if (currentRecordingId.current && currentRecordingId.current !== event.payload.recording_id) return;
           setState(prev => ({ ...prev, status: RecordingStatus.ERROR, statusMessage: event.payload.data?.error,
             isRecording: false, isPaused: false, isActive: false }));

@@ -18,16 +18,16 @@ const mount = async () => { await act(async () => { renderer = create(<Recording
 const event = async (name: string, payload: unknown = {}) => { await act(async () => { handlers.get(name)!({ payload }); }); };
 describe('Global native completion state', () => {
   test('external stop leaves STOPPING once native meeting is durable', async () => {
-    await mount(); await event('recording-started'); await event('recording.started', { recording_id: 'recording-1' });
+    await mount(); await event('recording-started'); await event('recording:started', { recording_id: 'recording-1' });
     await event('recording-stopped', { message: 'Capture stopped' }); expect(state.status).toBe(RecordingStatus.STOPPING);
-    await event('meeting.finalized', { recording_id: 'recording-1', meeting_id: 'meeting-1' });
+    await event('meeting:finalized', { recording_id: 'recording-1', meeting_id: 'meeting-1' });
     expect(state.status).toBe(RecordingStatus.IDLE); expect(state.isRecording).toBe(false);
     await event('recording-stopped', { message: 'Recording saved', recording_id: 'recording-1', state: 'finalized' });
     expect(state.status).toBe(RecordingStatus.IDLE);
   });
   test('a delayed old completion cannot stop a newer recording', async () => {
-    await mount(); await event('recording-started'); await event('recording.started', { recording_id: 'recording-new' });
-    await event('meeting.finalized', { recording_id: 'recording-old', meeting_id: 'meeting-old' });
+    await mount(); await event('recording-started'); await event('recording:started', { recording_id: 'recording-new' });
+    await event('meeting:finalized', { recording_id: 'recording-old', meeting_id: 'meeting-old' });
     await event('recording-stopped', { message: 'Recording saved', recording_id: 'recording-old', state: 'finalized' });
     expect(state.isRecording).toBe(true); expect(state.status).toBe(RecordingStatus.RECORDING);
   });

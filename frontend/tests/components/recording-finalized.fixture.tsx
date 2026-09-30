@@ -13,7 +13,7 @@ beforeEach(() => { handlers.clear(); complete.mockClear(); unlisten.mockClear();
 afterEach(() => { if (renderer) act(() => renderer!.unmount()); renderer = undefined; });
 afterAll(() => { mock.module('@tauri-apps/api/event', () => originalEvents); mock.module('../../src/hooks/useRecordingStop', () => originalStop); });
 const mount = async () => { await act(async () => { renderer = create(<RecordingPostProcessingProvider><div /></RecordingPostProcessingProvider>); }); };
-const finalized = (recording_id: string, meeting_id: string) => handlers.get('meeting.finalized')!({ payload: { recording_id, meeting_id } });
+const finalized = (recording_id: string, meeting_id: string) => handlers.get('meeting:finalized')!({ payload: { recording_id, meeting_id } });
 describe('Finalization from CLI, MCP and detector', () => {
   test('refreshes explicit finalized meeting without a GUI stop or latest-session lookup', async () => {
     await mount(); finalized('recording-old', 'meeting-old');

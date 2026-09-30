@@ -13,7 +13,7 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
   useEffect(() => {
     let active = true;
     const handled = new Set<string>();
-    const listener = listen<MeetingFinalizedEvent>('meeting.finalized', event => {
+    const listener = listen<MeetingFinalizedEvent>('meeting:finalized', event => {
       const { recording_id, meeting_id } = event.payload;
       if (!active || !recording_id || !meeting_id || handled.has(recording_id)) return;
       handled.add(recording_id);

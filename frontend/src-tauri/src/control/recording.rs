@@ -178,7 +178,7 @@ async fn dispatch_inner<R: Runtime>(
                     return Ok(json!({"recording":existing,"idempotent":true}));
                 }
             }
-            if active().is_some() || audio::is_recording().await {
+            if active().is_some() || capture_is_recording(&app).await {
                 return Err(ControlError::new(
                     "recording_active",
                     "A recording is already active",
@@ -252,9 +252,9 @@ async fn dispatch_inner<R: Runtime>(
             *DRAINED.lock().unwrap() = None;
             *CAPTURE_FOLDER.lock().unwrap() = None;
             *FILE_DIRTY.lock().unwrap() = false;
-            match audio::start_recording_raw(app.clone(), mic, system, Some(title)).await {
+            match capture_start(app.clone(), mic, system, Some(title)).await {
                 Ok(()) => {
-                    *CAPTURE_FOLDER.lock().unwrap() = audio::get_meeting_folder_path().await?;
+                    *CAPTURE_FOLDER.lock().unwrap() = capture_folder(&app).await?;
                     let publication = async {
                         persistence::transition(&pool, &session.recording_id, "recording", None)
                             .await
@@ -268,7 +268,7 @@ async fn dispatch_inner<R: Runtime>(
                             error.message
                         ));
                         // Stop capture directly while holding the lifecycle lock; never recurse through dispatch.
-                        let _ = audio::stop_recording_raw(app.clone()).await;
+                        let _ = capture_stop(app.clone()).await;
                         *DRAINED.lock().unwrap() = Some(CAPTURE_FOLDER.lock().unwrap().clone());
                         let pending = PENDING.lock().unwrap().clone();
                         let mut remaining = Vec::new();
@@ -333,7 +333,7 @@ async fn dispatch_inner<R: Runtime>(
                 persistence::transition(&pool, &session.recording_id, "stopping", None)
                     .await
                     .map_err(db_error)?;
-                match audio::stop_recording_raw(app.clone()).await {
+                match capture_stop(app.clone()).await {
                     Ok(folder) => {
                         *DRAINED.lock().unwrap() = Some(folder.clone());
                         folder
@@ -396,7 +396,7 @@ async fn dispatch_inner<R: Runtime>(
             *ACTIVE.lock().unwrap() = None;
             *DRAINED.lock().unwrap() = None;
             // The durable finalized event is committed in the same transaction.
-            let _=app.emit("meeting.finalized",json!({"recording_id":session.recording_id,"meeting_id":session.meeting_id,"data":{"folder_path":folder}}));
+            let _=app.emit(&super::native_event_name("meeting.finalized"),json!({"recording_id":session.recording_id,"meeting_id":session.meeting_id,"data":{"folder_path":folder}}));
             let finalized = persistence::get(&pool, &session.recording_id)
                 .await
                 .map_err(db_error)?;
@@ -418,9 +418,9 @@ async fn dispatch_inner<R: Runtime>(
                 .unwrap();
             if current.state != target {
                 let result = if method == "recording.pause" {
-                    audio::pause_recording_raw(app.clone()).await
+                    capture_pause(app.clone()).await
                 } else {
-                    audio::resume_recording_raw(app.clone()).await
+                    capture_resume(app.clone()).await
                 };
                 result.map_err(|e| ControlError::new("recording_transition_failed", e))?;
                 persistence::transition(&pool, &session.recording_id, target, None)
@@ -540,3 +540,59 @@ pub fn validate_capture_start<R: Runtime>(app: &AppHandle<R>) -> Result<(), Stri
     }
     Ok(())
 }
+
+// These wrappers preserve the production capture calls. A test-only, per-app
+// recorder fixture controls the hardware boundary while exercising dispatch,
+// durable persistence, checkpointing and finalization unchanged.
+async fn capture_start<R: Runtime>(
+    app: AppHandle<R>,
+    mic: Option<String>,
+    system: Option<String>,
+    title: Option<String>,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(recorder) = app.try_state::<headless::Recorder>() {
+        return recorder.start().await;
+    }
+    audio::start_recording_raw(app, mic, system, title).await
+}
+async fn capture_stop<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(recorder) = app.try_state::<headless::Recorder>() {
+        return recorder.stop(&app).await;
+    }
+    audio::stop_recording_raw(app).await
+}
+async fn capture_pause<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(test)]
+    if app.try_state::<headless::Recorder>().is_some() {
+        return Ok(());
+    }
+    audio::pause_recording_raw(app).await
+}
+async fn capture_resume<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(test)]
+    if app.try_state::<headless::Recorder>().is_some() {
+        return Ok(());
+    }
+    audio::resume_recording_raw(app).await
+}
+async fn capture_is_recording<R: Runtime>(app: &AppHandle<R>) -> bool {
+    #[cfg(test)]
+    if let Some(recorder) = app.try_state::<headless::Recorder>() {
+        return recorder.is_recording();
+    }
+    let _ = app;
+    audio::is_recording().await
+}
+async fn capture_folder<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if app.try_state::<headless::Recorder>().is_some() {
+        return Ok(None);
+    }
+    let _ = app;
+    audio::get_meeting_folder_path().await
+}
+#[cfg(test)]
+#[path = "recording_headless.rs"]
+mod headless;

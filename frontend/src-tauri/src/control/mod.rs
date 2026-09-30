@@ -9,6 +9,12 @@ pub use meetily_local_control::ControlError;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
+/// Dotted event identifiers belong to the durable gateway protocol. Tauri
+/// restricts native event names, so its transport uses the colon equivalent.
+pub fn native_event_name(event: &str) -> String {
+    event.replace('.', ":")
+}
+
 pub async fn emit_event<R: Runtime>(
     app: &AppHandle<R>,
     event: &str,
@@ -28,7 +34,7 @@ pub async fn emit_event<R: Runtime>(
     )
     .await?;
     app.emit(
-        event,
+        &native_event_name(event),
         serde_json::json!({"recording_id":recording_id,"meeting_id":meeting_id,"data":data}),
     )
     .map_err(|e| ControlError::new("internal", e.to_string()))?;

@@ -61,6 +61,7 @@ jobs:
         with:
           workspaces: '. -> target'
           key: calls-preview-${{ matrix.target }}
+          cache-on-failure: true
       - name: Toolchain versions
         run: |
           rustc --version
