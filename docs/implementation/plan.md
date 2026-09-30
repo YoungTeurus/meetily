@@ -29,7 +29,7 @@
 - [x] CLI/MCP (`meetilyctl/`): same RPC contract and discovery file `integration.json` in fork app data, optional `MEETILY_INTEGRATION_FILE` override. Official SDK stdio server; read tools default, control tools only with control credential. Test CLI and real SDK initialize/list/call, stdout purity, finite wait and event reconnect.
 - [x] Detection (`call-detection/`, `frontend/src-tauri/src/detection/`): native Core Audio + Accessibility and WASAPI + UI Automation observations, honest evidence/permission limitations. Pure state tests for 3s debounce, 20s grace, skip, late action, mute, process/device/reconnect, independent recordings. No process-only confirmed calls.
 - [x] UI/integration: shared backend commands, settings, compact action window, tray lifecycle, autostart opt-in, no required summarization; backend language/devices settings. Reuse existing visible recording indicators.
-- [ ] Packaging/CI/docs: isolated fork identity/data/update channel; native macOS/Windows tests and installer/CLI artifacts without release publication; local setup/MCP examples/capability matrix/manual audio test checklist. Verify and attempt draft PR in fork.
+- [x] Packaging/CI/docs: isolated fork identity/data/update channel; native macOS/Windows tests and installer/CLI artifacts without release publication; local setup/MCP examples/capability matrix/manual audio test checklist. Draft PR #1 prepared in fork. Both platform builds passed in run 36745310096; physical acceptance remains separate.
 
 ## Review focus
 

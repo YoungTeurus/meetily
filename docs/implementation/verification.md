@@ -54,6 +54,17 @@ On 2026-09-30 the user tested the macOS Preview with **Zoom 7.1.9, Russian UI**.
 
 ## Final run results and artifacts
 
+### Current native preview
+
+[Native run 36745310096](https://github.com/YoungTeurus/meetily/actions/runs/36745310096) builds implementation **`0f28ea01bf1d769208285e82b4ba37a85c1f29de`**, PR merge checkout **`2c13e154458d04be951599d5df08935686f31a2b`**. This build includes Codex CLI summaries, automatic retranscription and live notes. Later documentation-only commits do not change the tested implementation.
+
+- **macOS ARM64 succeeded:** desktop **275 passed, 0 failed, 4 ignored** (10.07 seconds); gateway/storage 27, detector 30, CLI/MCP 17, frontend 56 top-level tests/types passed. Release `.app`, DMG and standalone CLI built.
+- [Download current macOS DMG and CLI](https://github.com/YoungTeurus/meetily/actions/runs/36745310096/artifacts/11112857131), 51,509,888 bytes, expires **2026-10-14**. Archive SHA256: `9c24b77ccb119375d92f9e27b0f4016ad941a608adb4c390b425cbb36970133a`.
+- **Windows x64 succeeded:** desktop **269 passed, 0 failed, 3 ignored** (22.70 seconds), including the CPAL thread-teardown regression and Codex process-job success/descendant-timeout test; gateway/storage 27, detector 30, CLI/MCP 17, frontend 56 top-level tests/types passed. Release NSIS `.exe`, MSI and standalone CLI built. The test-resource fix preserves native test startup without duplicating the production resource.
+- [Download Windows installers and CLI](https://github.com/YoungTeurus/meetily/actions/runs/36745310096/artifacts/11112174638), 113,305,848 bytes, expires **2026-10-14**. Archive SHA256: `2c2c9f7025cb1cddec590c624ef18076407b41b7e1c461242333ffac3f5996ea`.
+
+Both native jobs completed successfully. macOS is ad-hoc signed without Developer ID/notarization; Windows installers are unsigned. These CI results do not replace physical audio, real-account Codex or minimum-OS acceptance.
+
 ### Codex CLI, automatic retranscription and live notes follow-up
 
 The user confirmed successful manual retranscription in the current macOS Preview and requested Codex CLI inside Generate summary, optional automatic processing after **every** finalized recording, and notes during the call. These additions are implemented in the follow-up tree; the `cb1337e` artifact below does not contain them.
@@ -62,12 +73,12 @@ The user confirmed successful manual retranscription in the current macOS Previe
 - Gateway/storage: **27 passed**, including durable automatic-queue handoff/snapshots/recovery/atomic cancel and four notes persistence/summary-context regressions (`/tmp/meetily-followup-control-tests.log`). Clippy with warnings denied passed.
 - Frontend: **56 top-level tests passed, 0 failed, 198 assertions**, plus isolated component scenarios including notes autosave/conflicts, authoritative recording identity, settings and summary flush ordering. Seven dedicated auto-summary readiness scenarios verify waiting for background processing, failure/cancellation fallback and fail-closed status-query errors. Explicit Generate/Regenerate/Stop consumes deferred automatic intent. TypeScript and the final production Next.js export passed after the coordination change. Logs: `/tmp/meetily-auto-summary-full-ui.log`, `/tmp/meetily-followup-final-next.log`.
 - Actual installed Codex **0.159.0-alpha.3** was run against a localhost fake Responses endpoint. Exactly one request arrived, with **`tools: []`**; the endpoint deliberately returned HTTP 400 to stop execution. This proves tool advertisement for that tested version/configuration, not real-account summary quality. No paid model request or user-authentication changes were performed.
-- Windows resource-link fixture passed: exactly one generated Tauri resource reaches the library test harness and exactly one reaches the production application's linker. Actual MSVC execution and packaging require the next native run.
+- Windows resource-link fixture passed: exactly one generated Tauri resource reaches the library test harness and exactly one reaches the production application's linker. Native run 36745310096 subsequently passed actual MSVC tests and installer packaging.
 - Independent integration review found and prompted fixes for explicit Codex path clearing, native npm executable discovery with Finder's restricted PATH, and automatic-processing admission. No remaining concrete P1/P2 finding at handoff to native CI.
 
 Automatic processing remains cooperative at native audio-fragment boundaries: recording start waits up to 30 seconds, then returns a retryable `audio_busy` error if the current native operation has not yielded. Real logged-in Codex summary generation, after-call inference and live notes with physical audio remain local acceptance checks.
 
-### Current native preview
+### Previous native preview
 
 [Native CI run 36735969234](https://github.com/YoungTeurus/meetily/actions/runs/36735969234) builds implementation **`cb1337e2d8345f6ff56957468b9ce2ae70857cde`**, with PR merge checkout **`e103c880251701f4c0d47e1231cb122a8a025b55`**. Later documentation-only commits do not change this tested implementation.
 
