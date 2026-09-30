@@ -18,6 +18,9 @@ if (platform === 'darwin') env.MACOSX_DEPLOYMENT_TARGET = '14.2';
 if (platform === 'win32') {
   env.CMAKE_PROJECT_INCLUDE = join(root, '.github/force-portable-ggml.cmake').replaceAll('\\', '/');
   env.RUSTFLAGS = '-C target-cpu=x86-64-v2';
+  // cargo test does not run Tauri's setup, which selects the bundled runtime.
+  // build.rs verifies/stages this DLL before launching the desktop test binary.
+  env.ORT_DYLIB_PATH = join(root, 'frontend/src-tauri/binaries/onnxruntime/onnxruntime.dll');
 }
 function version(command, args) {
   const result = spawnSync(command, args, { cwd: root, env, encoding: 'utf8' });
@@ -41,7 +44,9 @@ copyFileSync(join(root, `target/${target}/release/llama-helper${extension}`), jo
 for (const manifest of ['local-control/Cargo.toml', 'call-detection/Cargo.toml', 'meetilyctl/Cargo.toml']) {
   run('cargo', ['test', '--locked', '--manifest-path', manifest, '--target', target]);
 }
-run('cargo', ['test', '--locked', '-p', 'meetily', '--lib', '--target', target]);
+const desktopTests = ['test', '--locked', '-p', 'meetily', '--lib', '--target', target];
+if (platform === 'win32') desktopTests.push('--', '--test-threads=1', '--nocapture');
+run('cargo', desktopTests);
 run('cargo', ['build', '--locked', '--release', '--manifest-path', 'meetilyctl/Cargo.toml', '--target', target]);
 const overlay = join(root, '.calls-preview.config.json');
 const previewConfig = { bundle: { createUpdaterArtifacts: false } };

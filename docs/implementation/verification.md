@@ -50,7 +50,7 @@ Teams and browser-specific detection are `unsupported`, not guessed from a proce
 
 ## Final run results and artifacts
 
-- Full Linux desktop check: passed. Full desktop library tests: 252 passed, 0 failed, 2 ignored (7.34 seconds after compilation), including the headless shared lifecycle test. The earlier 251-test run preceded this regression test.
+- Full Linux desktop check: passed. Full desktop library tests: 251 passed, 0 failed, 3 ignored (7.21 seconds after compilation), including the headless shared lifecycle test. The immediately preceding run passed 252 with 2 ignored; the physical output-device assertion is now an explicitly manual test because the Windows CI runner has no default audio device.
 - Local gateway/storage: 13 passed; Clippy `--all-targets -- -D warnings` passed (3 access/cancellation, 1 import, 3 read/pagination, 6 exact desktop persistence tests).
 - CLI/MCP: 17 passed. Clippy with `-D warnings`, formatter check and Linux release build passed. Installed `codex mcp add --help` confirms configuration command syntax; user configuration was not modified.
 - Detector: 17 fixture tests passed; Apple Silicon and Windows GNU native source checks passed.

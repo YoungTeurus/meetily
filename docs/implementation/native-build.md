@@ -117,11 +117,11 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.42s
 This compiles the complete Linux desktop library against real GTK/audio/Whisper/ONNX dependencies and its real bundled helper/FFmpeg resources. It does not prove native macOS/Windows compilation or real-call behavior. Log: `/workspace/linux-deps/cargo-check-native.log`. The complete desktop library test binary compiled and linked successfully in 3m 27s. Its initial launch reported `libonnxruntime.so.1: cannot open shared object file`; the script now adds `ORT_LIB_LOCATION` to `LD_LIBRARY_PATH` and the cached rerun **passed**:
 
 ```text
-test result: ok. 252 passed; 0 failed; 2 ignored; 0 measured;
-0 filtered out; finished in 7.34s
+test result: ok. 251 passed; 0 failed; 3 ignored; 0 measured;
+0 filtered out; finished in 7.21s
 ```
 
-Command: `./scripts/check-linux-native.sh --test` with the documented ORT environment. Final log including the headless recorder orchestration test: `/tmp/meetily-headless-full-native.log` (earlier 251-test log: `/workspace/linux-deps/cargo-test-native.log`). APT skips already-installed runtime packages, so 78 user-local sysroot links point to genuine host runtime libraries; the preparation command above reproduces those links without changing host files.
+Command: `./scripts/check-linux-native.sh --test` with the documented ORT environment. Final log including the headless recorder orchestration test and explicitly manual physical-device test: `/tmp/meetily-final-native-tests.log` (earlier run before the hardware-test annotation: `/tmp/meetily-headless-full-native.log`). APT skips already-installed runtime packages, so 78 user-local sysroot links point to genuine host runtime libraries; the preparation command above reproduces those links without changing host files.
 
 Build script JavaScript syntax (`node --check`) and workflow YAML parsing passed. These checks prove parsing only. Native CI was started by [draft PR #1](https://github.com/YoungTeurus/meetily/pull/1): [run 36723904371](https://github.com/YoungTeurus/meetily/actions/runs/36723904371), implementation commit `d9a43d85c06574e9a797a6f99422759ad7962437`. Installer outcomes are recorded in [verification.md](verification.md). No real-call validation is claimed. Native installers, audio permissions, notification activation, actual Zoom/Discord detection, and older OS compatibility remain pending their documented native/manual checks.
 
@@ -149,3 +149,13 @@ We also inspected the exact Windows FFmpeg 8.0.1 essentials archive used by the 
 **Pending native qualification:** these API/import and installer syntax checks establish and enforce the intended floor; they do not prove a successful installed application on build 19041. Install/run both transcription engines, notifications, CLI and detection on a Windows 10 2004 VM before declaring runtime qualification complete. Run both NSIS and MSI on 1809/17763 and confirm rejection, on 2004/19041 and Windows 11 and confirm acceptance, including silent installer modes. Native CI must still compile/link the full generated installers and actual calls must still be tested on each supported OS.
 
 References: [Core Audio process taps](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:)), [audio-session process ID](https://learn.microsoft.com/en-us/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessioncontrol2-getprocessid), [Tao source at the locked version](https://github.com/tauri-apps/tao/blob/tao-v0.37.1/src/platform_impl/windows/util.rs), [DXCoreCreateAdapterFactory API minimum](https://github.com/MicrosoftDocs/sdk-api/blob/docs/sdk-api-src/content/dxcore/nf-dxcore-dxcorecreateadapterfactory.md), [ONNX Runtime 1.22.0 source](https://github.com/microsoft/onnxruntime/tree/v1.22.0), [current runner labels](https://github.com/actions/runner-images).
+
+## Native CI test environment
+
+The first Windows job compiled and linked the desktop library and passed gateway (13), detector (17), and CLI/MCP (17) tests, then failed the pre-existing `audio::playback_monitor::tests::test_get_output_device` assertion because the runner has no default audio output. That physical-device test is explicitly ignored in the default suite; run it on an interactive target desktop with:
+
+```sh
+cargo test --locked -p meetily --lib audio::playback_monitor::tests::test_get_output_device -- --ignored --nocapture
+```
+
+The Windows test process also terminated with `STATUS_ACCESS_VIOLATION` (`0xc0000005`), independently unresolved by the missing-device assertion. Unlike application startup, the test binary never runs Tauri setup's `ort::init_from`. The native build script now explicitly selects the SHA-verified bundled ONNX Runtime via `ORT_DYLIB_PATH`, and runs Windows desktop tests serially with visible test output to identify any remaining native crash. No VAD or ONNX tests are skipped. Runtime selection was a discrepancy; it is not yet proven to be the access-violation cause.
