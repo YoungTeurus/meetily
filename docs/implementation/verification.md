@@ -56,6 +56,14 @@ On 2026-09-30 the user tested the macOS Preview with **Zoom 7.1.9, Russian UI**.
 
 ### Current native preview
 
+Refreshed on **2026-10-26** for the user's **macOS 26.2 / Apple Silicon** setup. [Native run 40344963321](https://github.com/YoungTeurus/meetily/actions/runs/40344963321) builds branch commit `91e64b9ddeea5c4755f22452149e052e528b6a88`, PR merge checkout `e45657f8cb75cdcaf7e2136a867b9c873ce88876`. Application code remains the last implementation `0f28ea0`; subsequent changes are documentation and the macOS runner update.
+
+The old `macos-14` runner is being retired and October 26 falls in its [announced brownout](https://github.com/actions/runner-images/issues/13518). The workflow now uses the supported ARM64 `macos-15` runner. Frontend tests/types, native tests, desktop/CLI packaging and artifact upload all passed. The deployment target remains 14.2; the user no longer requires older macOS qualification. This run does not constitute a physical test on macOS 26.2.
+
+[Download current Apple Silicon DMG and CLI](https://github.com/YoungTeurus/meetily/actions/runs/40344963321/artifacts/12662512590): ZIP **51,516,903 bytes**, expires **2026-11-09**. Archive SHA256: `a5eb0fa9267837ab640e85029cbc35d82619629a582cbfd06c31ab4cf5a72eeb`. Ad-hoc signed, without Developer ID/notarization. Fully quit the previous Preview before replacing the app in Applications.
+
+### September native preview
+
 [Native run 36745310096](https://github.com/YoungTeurus/meetily/actions/runs/36745310096) builds implementation **`0f28ea01bf1d769208285e82b4ba37a85c1f29de`**, PR merge checkout **`2c13e154458d04be951599d5df08935686f31a2b`**. This build includes Codex CLI summaries, automatic retranscription and live notes. Later documentation-only commits do not change the tested implementation.
 
 - **macOS ARM64 succeeded:** desktop **275 passed, 0 failed, 4 ignored** (10.07 seconds); gateway/storage 27, detector 30, CLI/MCP 17, frontend 56 top-level tests/types passed. Release `.app`, DMG and standalone CLI built.
