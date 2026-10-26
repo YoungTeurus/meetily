@@ -1,3 +1,5 @@
+> **Calls Preview fork:** experimental call detection, shared backend recording, CLI and local MCP. See [installation and usage](docs/CALLS_PREVIEW.ru.md), [verification status](docs/implementation/verification.md), and [native builds](docs/implementation/native-build.md). This preview uses a separate application/data identity; real-call acceptance is pending.
+
 <div align="center" style="border-bottom: none">
     <h1>
         <img src="docs/Meetily-6.png" style="border-radius: 10px;" />

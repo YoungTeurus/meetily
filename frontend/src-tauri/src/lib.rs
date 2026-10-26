@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
+
+// Tauri links application resources to binaries; the library test harness also
+// needs the Common Controls v6 manifest, but production targets must link it once.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+mod windows_test_resource;
+
 // Removed unused import
 
 // Performance optimization: Conditional logging macros for hot paths
@@ -39,6 +45,9 @@ pub mod analytics;
 pub mod api;
 pub mod audio;
 pub mod config;
+pub mod control;
+pub mod detection;
+pub mod call_notifications;
 pub mod console_utils;
 pub mod database;
 pub mod notifications;
@@ -121,9 +130,9 @@ mod onnx_runtime_tests {
     }
 }
 
-// Global language preference storage (default to "auto-translate" for automatic translation to English)
+// Backend language preference; persisted by the recording lifecycle.
 static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
-    std::sync::LazyLock::new(|| StdMutex::new("auto-translate".to_string()));
+    std::sync::LazyLock::new(|| StdMutex::new("auto".to_string()));
 
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
@@ -201,12 +210,6 @@ async fn start_recording<R: Runtime>(
 #[tauri::command]
 async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
-
-    // Check the actual audio recording system state instead of the flag
-    if !audio::recording_commands::is_recording().await {
-        log_info!("Recording is already stopped");
-        return Ok(());
-    }
 
     // Call the actual audio recording system to stop
     match audio::recording_commands::stop_recording(
@@ -430,12 +433,19 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
 }
 
 #[tauri::command]
-async fn set_language_preference(language: String) -> Result<(), String> {
-    let mut lang_pref = LANGUAGE_PREFERENCE
-        .lock()
-        .map_err(|e| format!("Failed to set language preference: {}", e))?;
-    log_info!("Setting language preference to: {}", language);
-    *lang_pref = language;
+async fn set_language_preference<R: Runtime>(app: AppHandle<R>, language: String) -> Result<(), String> {
+    control::recording::set_language(&app,language).await.map_err(|e|e.message)
+}
+
+#[tauri::command]
+async fn get_language_preference<R: Runtime>(app: AppHandle<R>) -> String {
+    use tauri_plugin_store::StoreExt;
+    app.store("recording_preferences.json").ok().and_then(|s|s.get("language")).and_then(|v|v.as_str().map(str::to_owned))
+        .unwrap_or_else(||get_language_preference_internal().unwrap_or_else(||"auto".to_string()))
+}
+
+pub fn set_language_preference_internal(language: String) -> Result<(), String> {
+    *LANGUAGE_PREFERENCE.lock().map_err(|e|e.to_string())?=language;
     Ok(())
 }
 
@@ -465,6 +475,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_autostart::Builder::new().app_name("Meetily Calls Preview").args(["--background"]).build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -585,6 +596,20 @@ pub fn run() {
             })
             .expect("Failed to initialize database");
 
+            // Start observation and opt-in local control independently of React pages.
+            let local_app = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = control::start(local_app.clone()).await {
+                    log::error!("Local control startup failed: {e}");
+                }
+                if let Err(e) = detection::start(local_app) {
+                    log::error!("Call detection startup failed: {e}");
+                }
+            });
+            if std::env::args().any(|arg| arg == "--background") {
+                if let Some(window) = _app.get_webview_window("main") { let _ = window.hide(); }
+            }
+
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");
             if let Ok(resource_path) = _app.handle().path().resource_dir() {
@@ -610,6 +635,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            control::gateway::get_integration_settings,
+            control::gateway::set_integration_settings,
+            control::gateway::rotate_integration_keys,
+            control::gateway::get_login_start,
+            control::gateway::set_login_start,
+            detection::get_detection_status,
+            detection::set_detection_settings,
+            detection::detection_action,
+            call_notifications::open_call_action,
+            call_notifications::close_call_action,
+            call_notifications::open_detection_permissions,
             start_recording,
             stop_recording,
             is_recording,
@@ -718,6 +754,7 @@ pub fn run() {
             api::api_save_profile,
             api::api_update_profile,
             api::api_get_model_config,
+            api::api_check_codex_cli,
             api::api_save_model_config,
             api::api_get_api_key,
             // api::api_get_auto_generate_setting,
@@ -774,6 +811,8 @@ pub fn run() {
             audio::recording_preferences::get_audio_backend_info,
             // Language preference commands
             set_language_preference,
+            get_language_preference,
+            control::recording::get_recording_session,
             // Notification system commands
             notifications::commands::get_notification_settings,
             notifications::commands::set_notification_settings,
@@ -824,6 +863,16 @@ pub fn run() {
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
             audio::retranscription::is_retranscription_in_progress_command,
+            audio::retranscription::get_retranscription_status_command,
+            audio::retranscription::get_whisper_vocabulary,
+            audio::retranscription::save_global_whisper_vocabulary,
+            audio::retranscription::get_meeting_transcription_info,
+            database::notes_commands::get_meeting_notes,
+            database::notes_commands::save_meeting_notes,
+            audio::automatic_retranscription::get_automatic_retranscription_settings,
+            audio::automatic_retranscription::set_automatic_retranscription_settings,
+            audio::automatic_retranscription::get_automatic_retranscription_status,
+            audio::automatic_retranscription::cancel_automatic_retranscription,
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,

@@ -13,20 +13,17 @@ use std::sync::{
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
 
+use super::device_monitor::{DeviceEvent, DeviceMonitorType};
 use super::{
-    recording_manager::RecordingStartError,
+    default_input_device,  // Get default microphone
+    default_output_device, // Get default system audio
     parse_audio_device,
-    default_input_device,   // Get default microphone
-    default_output_device,  // Get default system audio
+    recording_manager::RecordingStartError,
     RecordingManager,
 };
-use super::device_monitor::{DeviceEvent, DeviceMonitorType};
 
 // Import transcription modules
-use super::transcription::{
-    self,
-    reset_speech_detected_flag,
-};
+use super::transcription::{self, reset_speech_detected_flag};
 
 // Re-export TranscriptUpdate for backward compatibility
 pub use super::transcription::TranscriptUpdate;
@@ -104,10 +101,8 @@ static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
-static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
-const TRANSCRIPTION_RUNTIME_START_ERROR_CODE: &str =
-    "TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED";
+const TRANSCRIPTION_RUNTIME_START_ERROR_CODE: &str = "TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED";
 const TRANSCRIPTION_RUNTIME_USER_MESSAGE: &str = "Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.";
 
 // ============================================================================
@@ -126,22 +121,22 @@ pub struct TranscriptionStatus {
     pub last_activity_ms: u64,
 }
 
-fn map_recording_start_error<R: Runtime>(
-    app: &AppHandle<R>,
-    error: RecordingStartError,
-) -> String {
+fn map_recording_start_error<R: Runtime>(app: &AppHandle<R>, error: RecordingStartError) -> String {
     crate::tray::update_tray_menu(app);
 
     match error {
         RecordingStartError::TranscriptionRuntime(source) => {
             error!("Failed to initialize speech recognition: {source:#}");
             let error = RecordingStartError::TranscriptionRuntime(source);
-            if let Err(emit_error) = app.emit("transcription-error", serde_json::json!({
-                "error": error.to_string(),
-                "userMessage": TRANSCRIPTION_RUNTIME_USER_MESSAGE,
-                "actionable": false,
-                "phase": "startup"
-            })) {
+            if let Err(emit_error) = app.emit(
+                "transcription-error",
+                serde_json::json!({
+                    "error": error.to_string(),
+                    "userMessage": TRANSCRIPTION_RUNTIME_USER_MESSAGE,
+                    "actionable": false,
+                    "phase": "startup"
+                }),
+            ) {
                 error!("Failed to emit transcription runtime startup error: {emit_error}");
             }
             TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
@@ -225,7 +220,10 @@ fn resolve_mic_or_default<R: Runtime>(
             Some(Arc::new(device))
         }
         Err(e) => {
-            warn!("❌ No microphone available: {} — recording system audio only", e);
+            warn!(
+                "❌ No microphone available: {} — recording system audio only",
+                e
+            );
             let _ = app.emit("mic-unavailable", serde_json::json!({}));
             None
         }
@@ -260,7 +258,10 @@ fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::
             Some(Arc::new(device))
         }
         Err(e) => {
-            warn!("⚠️ No system audio available: {} — recording will continue with microphone only", e);
+            warn!(
+                "⚠️ No system audio available: {} — recording will continue with microphone only",
+                e
+            );
             None
         }
     }
@@ -274,13 +275,11 @@ async fn prepare_audio_for_recording(
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
 
-    let wake_name = system_device
-        .map(|s| s.name.clone())
-        .or_else(|| {
-            cpal::default_host()
-                .default_output_device()
-                .and_then(|d| d.name().ok())
-        });
+    let wake_name = system_device.map(|s| s.name.clone()).or_else(|| {
+        cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+    });
     if let Some(name) = wake_name {
         if let Err(e) = super::recording_manager::wake_audio_connection(&name).await {
             warn!("[AUDIO_WAKE] Wake failed: {} — proceeding anyway", e);
@@ -303,186 +302,21 @@ pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     start_recording_with_meeting_name(app, None).await
 }
 
-/// Start recording with default devices and optional meeting name
+/// GUI and tray entry points delegate to the shared backend lifecycle.
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    info!(
-        "Starting recording with default devices, meeting: {:?}",
-        meeting_name
-    );
-
-    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
-
-    // Check if already recording
-    let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
-    info!("🔍 IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
-    }
-
-    if let Err(error) = crate::ensure_onnx_runtime_available() {
-        return Err(map_recording_start_error(
-            &app,
-            RecordingStartError::TranscriptionRuntime(error),
-        ));
-    }
-
-    // Validate that transcription models are available before starting recording
-    info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": format!("Recording cannot start: {}", validation_error),
-            "actionable": false,
-            "phase": "startup"
-        }));
-
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
-
-    // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
-
-    // Load recording preferences to get auto_save AND device preferences
-    let (auto_save, preferred_mic_name, preferred_system_name) =
-        match super::recording_preferences::load_recording_preferences(&app).await {
-            Ok(prefs) => {
-                info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
-                      prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
-            }
-            Err(e) => {
-                warn!("Failed to load recording preferences, using defaults: {}", e);
-                (true, None, None)
-            }
-        };
-
-    #[cfg(not(target_os = "macos"))]
-    let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
-
-    let system_device = resolve_system_or_default(preferred_system_name.as_deref());
-
-    #[cfg(target_os = "macos")]
-    prepare_audio_for_recording(system_device.as_deref()).await?;
-
-    #[cfg(target_os = "macos")]
-    let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
-
-    // Async-first approach - no more blocking operations!
-    info!("🚀 Starting async recording initialization");
-
-    // Create new recording manager only after startup validation succeeds
-    let mut manager = RecordingManager::new();
-
-    // Always ensure a meeting name is set so incremental saver initializes
-    let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
-        // Example: Meeting 2025-10-03_08-25-23
-        let now = chrono::Local::now();
-        format!(
-            "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M-%S")
-        )
-    });
-    manager.set_meeting_name(Some(effective_meeting_name));
-
-    // Set up error callback
-    let app_for_error = app.clone();
-    manager.set_error_callback(move |error| {
-        let _ = app_for_error.emit("recording-error", error.user_message());
-    });
-
-    // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
-    let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save)
-        .await
-        .map_err(|error| map_recording_start_error(&app, error))?;
-
-    // Take the device event receiver BEFORE storing manager globally.
-    // A background task will process device events (hot-swap) without frontend polling.
-    let device_event_receiver = manager.take_device_event_receiver();
-    let session = manager.get_state().clone();
-
-    // Store the manager globally to keep it alive
-    {
-        let mut global_manager = RECORDING_MANAGER.lock().unwrap();
-        *global_manager = Some(manager);
-    }
-
-    // Spawn background device event processor (mic-disconnect fallback).
-    if let Some(receiver) = device_event_receiver {
-        spawn_device_event_processor(app.clone(), receiver, session);
-    }
-
-    // Flip recording live + reset per-session flags (speech-detected latch,
-    // mic-recovery budget). Shared with the other start path — see helper.
-    finalize_recording_start();
-    drop(engine_lifecycle_guard);
-
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        *global_task = Some(task_handle);
-    }
-
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
-    {
-        use tauri::Listener;
-        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
-            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                };
-
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
-            }
-        });
-        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
-        *global_listener = Some(listener_id);
-        info!("✅ Transcript-update event listener registered for history persistence");
-    }
-
-    // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started successfully with parallel processing",
-        "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
-
-    // Update tray menu to reflect recording state
-    crate::tray::update_tray_menu(&app);
-
-    info!("✅ Recording started successfully with async-first approach");
-
-    Ok(())
+    crate::control::recording::dispatch(
+        app,
+        "recording.start",
+        serde_json::json!({"name":meeting_name,"initiator":"gui"}),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message)
 }
 
-/// Start recording with specific devices
 pub async fn start_recording_with_devices<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
@@ -493,6 +327,16 @@ pub async fn start_recording_with_devices<R: Runtime>(
 
 /// Start recording with specific devices and optional meeting name
 pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+) -> Result<(), String> {
+    crate::control::recording::dispatch(app,"recording.start",serde_json::json!({"name":meeting_name,"input_device":mic_device_name,"output_device":system_device_name,"initiator":"gui"})).await.map(|_|()).map_err(|e|e.message)
+}
+
+/// Capture implementation; call only through control::recording.
+pub(crate) async fn start_recording_raw<R: Runtime>(
     app: AppHandle<R>,
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
@@ -526,21 +370,28 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
         // Emit error event for frontend - actionable: false to show toast instead of modal
         // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": format!("Recording cannot start: {}", validation_error),
-            "actionable": false,
-            "phase": "startup"
-        }));
+        let _ = app.emit(
+            "transcription-error",
+            serde_json::json!({
+                "error": validation_error,
+                "userMessage": format!("Recording cannot start: {}", validation_error),
+                "actionable": false,
+                "phase": "startup"
+            }),
+        );
 
         return Err(validation_error);
     }
     info!("✅ Transcription model validation passed");
 
     // Notify frontend that startup has begun (surfaces STARTING state)
-    app.emit("recording-starting", serde_json::json!({
-        "message": "Recording initialization started"
-    })).map_err(|e| e.to_string())?;
+    app.emit(
+        "recording-starting",
+        serde_json::json!({
+            "message": "Recording initialization started"
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
@@ -562,11 +413,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Load recording preferences to check auto_save setting
     let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
         Ok(prefs) => {
-            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
+            info!(
+                "📋 Loaded recording preferences: auto_save={}",
+                prefs.auto_save
+            );
             prefs.auto_save
         }
         Err(e) => {
-            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
+            warn!(
+                "Failed to load recording preferences, defaulting to auto_save=true: {}",
+                e
+            );
             true // Default to saving if preferences can't be loaded
         }
     };
@@ -574,24 +431,32 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
-        format!(
-            "Meeting {}",
-            now.format("%Y-%m-%d_%H-%M-%S")
-        )
+        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M-%S"))
     });
     manager.set_meeting_name(Some(effective_meeting_name));
 
     // Set up error callback
     let app_for_error = app.clone();
     manager.set_error_callback(move |error| {
+        if !error.is_recoverable() {
+            crate::control::recording::mark_failed(error.user_message().to_string());
+        }
         let _ = app_for_error.emit("recording-error", error.user_message());
     });
 
+    crate::control::recording::validate_capture_start(&app)?;
+
     // Start recording with specified devices and auto_save setting
-    let transcription_receiver = manager
+    let transcription_receiver = match manager
         .start_recording(mic_device, system_device, auto_save)
         .await
-        .map_err(|error| map_recording_start_error(&app, error))?;
+    {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            manager.cleanup_without_save().await;
+            return Err(map_recording_start_error(&app, error));
+        }
+    };
 
     // Take the device event receiver BEFORE storing manager globally.
     // A background task will process device events (hot-swap) without frontend polling.
@@ -621,48 +486,18 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         *global_task = Some(task_handle);
     }
 
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
-    {
-        use tauri::Listener;
-        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
-            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                };
-
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
-            }
-        });
-        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
-        *global_listener = Some(listener_id);
-        info!("✅ Transcript-update event listener registered for history persistence");
-    }
-
     // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started with custom devices and parallel processing",
-        "devices": [
-            mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
-            system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
-        ],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        "recording-started",
+        serde_json::json!({
+            "message": "Recording started with custom devices and parallel processing",
+            "devices": [
+                mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
+                system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
+            ],
+            "workers": 3
+        }),
+    );
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -677,6 +512,15 @@ pub async fn stop_recording<R: Runtime>(
     app: AppHandle<R>,
     _args: RecordingArgs,
 ) -> Result<(), String> {
+    crate::control::recording::dispatch(app, "recording.stop", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+pub(crate) async fn stop_recording_raw<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<String>, String> {
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
@@ -684,7 +528,7 @@ pub async fn stop_recording<R: Runtime>(
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
         info!("Recording was not active");
-        return Ok(());
+        return Ok(None);
     }
 
     // Emit shutdown progress to frontend
@@ -719,29 +563,17 @@ pub async fn stop_recording<R: Runtime>(
         (result, manager_for_cleanup)
     } else {
         warn!("No recording manager found to stop");
+        crate::control::recording::mark_failed("Recording manager was missing at shutdown".into());
         (Ok(()), None)
     };
 
     let (stop_result, manager_for_cleanup) = stop_result;
 
-    match stop_result {
-        Ok(_) => {
-            info!("✅ Audio streams stopped successfully - no more chunks will be created");
-        }
-        Err(e) => {
-            error!("❌ Failed to stop audio streams: {}", e);
-            return Err(format!("Failed to stop audio streams: {}", e)); // _stopping_guard clears on return
-        }
+    if let Err(error) = stop_result {
+        crate::control::recording::mark_failed(format!("Audio pipeline shutdown failed: {error}"));
     }
-
-    // Step 1.5: Clean up transcript listener to release microphone
-    // Unlisten transcript-update event to prevent lingering references
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
-        }
+    if let Err(error) = crate::control::recording::mark_capture_stopped(&app).await {
+        warn!("Capture stopped metadata could not be persisted yet: {error}");
     }
 
     // Step 2: Signal transcription workers to finish processing ALL queued chunks
@@ -786,22 +618,8 @@ pub async fn stop_recording<R: Runtime>(
             }
         });
 
-        // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle
-        ).await {
-            Ok(Ok(())) => {
-                info!("✅ ALL transcription chunks processed successfully - no data lost");
-            }
-            Ok(Err(e)) => {
-                warn!("⚠️ Transcription task completed with error: {:?}", e);
-                // Continue anyway - the worker may have processed most chunks
-            }
-            Err(_) => {
-                warn!("⏱️ Transcription timeout (10 minutes) reached, continuing shutdown to prevent indefinite hang");
-                // Continue shutdown even on timeout - better to lose some chunks than hang forever
-            }
+        if let Err(error) = task_handle.await {
+            crate::control::recording::mark_failed(format!("Transcription task failed: {error}"));
         }
 
         // Stop progress monitoring
@@ -825,11 +643,7 @@ pub async fn stop_recording<R: Runtime>(
     // Determine which provider was used and unload the appropriate model (with timeout)
     let config = match tokio::time::timeout(
         tokio::time::Duration::from_secs(30), // 30 seconds max for DB operation
-        crate::api::api::api_get_transcript_config(
-            app.clone(),
-            app.clone().state(),
-            None,
-        )
+        crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None),
     )
     .await
     {
@@ -863,7 +677,10 @@ pub async fn stop_recording<R: Runtime>(
                 info!("Current Parakeet model before unload: '{}'", current_model);
 
                 if engine.unload_model().await {
-                    info!("✅ Parakeet model '{}' unloaded successfully", current_model);
+                    info!(
+                        "✅ Parakeet model '{}' unloaded successfully",
+                        current_model
+                    );
                 } else {
                     warn!("⚠️ Failed to unload Parakeet model '{}'", current_model);
                 }
@@ -920,7 +737,17 @@ pub async fn stop_recording<R: Runtime>(
     };
 
     // Now perform async analytics tracking without holding manager reference
-    if let Some((total_duration, active_duration, pause_duration, transcript_segments_count, had_fatal_error, mic_device_name, sys_device_name, chunks_processed)) = analytics_data {
+    if let Some((
+        total_duration,
+        active_duration,
+        pause_duration,
+        transcript_segments_count,
+        had_fatal_error,
+        mic_device_name,
+        sys_device_name,
+        chunks_processed,
+    )) = analytics_data
+    {
         info!("📊 Collecting analytics for meeting end");
 
         // Helper function to classify device type from device name (privacy-safe)
@@ -932,7 +759,8 @@ pub async fn stop_recording<R: Runtime>(
                 || name_lower.contains("beats")
                 || name_lower.contains("headphones")
                 || name_lower.contains("bt ")
-                || name_lower.contains("wireless") {
+                || name_lower.contains("wireless")
+            {
                 "Bluetooth"
             } else {
                 "Wired"
@@ -951,23 +779,20 @@ pub async fn stop_recording<R: Runtime>(
             _ => None,
         };
 
-        let (transcription_provider, transcription_model) = transcription_config
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (transcription_provider, transcription_model) =
+            transcription_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Get summary model info from API
-        let summary_config = match crate::api::api::api_get_model_config(
-            app.clone(),
-            app.clone().state(),
-            None,
-        )
-        .await
-        {
-            Ok(Some(config)) => Some((config.provider, config.model)),
-            _ => None,
-        };
+        let summary_config =
+            match crate::api::api::api_get_model_config(app.clone(), app.clone().state(), None)
+                .await
+            {
+                Ok(Some(config)) => Some((config.provider, config.model)),
+                _ => None,
+            };
 
-        let (summary_provider, summary_model) = summary_config
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (summary_provider, summary_model) =
+            summary_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Classify device types (privacy-safe)
         let microphone_device_type = mic_device_name
@@ -1013,31 +838,27 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Perform final cleanup with the manager if available
-    let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
+    let (meeting_folder, _meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
         // Extract meeting info BEFORE async operations
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
-            manager.save_recording_only(&app)
-        ).await {
-            Ok(Ok(_)) => {
-                info!("✅ Recording data saved successfully during cleanup");
+        // Replay durable checkpoints, including every segment drained after capture stopped.
+        let history = match crate::control::recording::transcript_history(&app).await {
+            Ok(history) => history,
+            Err(error) => {
+                IS_RECORDING.store(false, Ordering::SeqCst);
+                return Err(error);
             }
-            Ok(Err(e)) => {
-                warn!(
-                    "⚠️ Error during recording cleanup (transcripts preserved): {}",
-                    e
-                );
-                // Don't fail shutdown - transcripts are already preserved
-            }
-            Err(_) => {
-                warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
-                // Don't fail shutdown - transcripts are already preserved
-            }
+        };
+        for segment in history {
+            manager.add_transcript_segment(segment);
+        }
+        if let Err(error) = manager.save_recording_only(&app).await {
+            IS_RECORDING.store(false, Ordering::SeqCst);
+            return Err(format!("Recording files could not be saved: {error}"));
         }
 
         (meeting_folder, meeting_name)
@@ -1051,50 +872,8 @@ pub async fn stop_recording<R: Runtime>(
     IS_RECORDING.store(false, Ordering::SeqCst);
     // IS_RECORDING_STOPPING is cleared by _stopping_guard on scope exit.
 
-    // Step 4.5: Prepare metadata for frontend (NO database save)
-    // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
-    // This ensures the user sees all transcripts streaming in before the database save happens.
-    let (folder_path_str, meeting_name_str) = match (&meeting_folder, &meeting_name) {
-        (Some(path), Some(name)) => (
-            Some(path.to_string_lossy().to_string()),
-            Some(name.clone()),
-        ),
-        _ => (None, None),
-    };
-
-    info!("📤 Preparing recording metadata for frontend save");
-    info!("   folder_path: {:?}", folder_path_str);
-    info!("   meeting_name: {:?}", meeting_name_str);
-
-    // Database save removed - frontend will handle this after receiving all transcripts
-    info!("ℹ️ Skipping database save in Rust - frontend will save after all transcripts received");
-
-    // Step 5: Complete shutdown
-    let _ = app.emit(
-        "recording-shutdown-progress",
-        serde_json::json!({
-            "stage": "complete",
-            "message": "Recording stopped successfully",
-            "progress": 100
-        }),
-    );
-
-    // Emit final stop event with folder_path and meeting_name for frontend to save
-    app.emit(
-        "recording-stopped",
-        serde_json::json!({
-            "message": "Recording stopped - frontend will save after all transcripts received",
-            "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
-        }),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);
-
-    info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
-    Ok(())
+    Ok(meeting_folder.map(|path| path.to_string_lossy().to_string()))
 }
 
 /// Check if recording is active
@@ -1114,6 +893,13 @@ pub async fn get_transcription_status() -> TranscriptionStatus {
 /// Pause the current recording
 #[tauri::command]
 pub async fn pause_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    crate::control::recording::dispatch(app, "recording.pause", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+pub(crate) async fn pause_recording_raw<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     info!("Pausing recording");
 
     // Check if currently recording
@@ -1148,6 +934,13 @@ pub async fn pause_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
 /// Resume the current recording
 #[tauri::command]
 pub async fn resume_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    crate::control::recording::dispatch(app, "recording.resume", serde_json::json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+pub(crate) async fn resume_recording_raw<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     info!("Resuming recording");
 
     // Check if currently recording
@@ -1225,7 +1018,9 @@ pub async fn get_recording_state() -> serde_json::Value {
 pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
-        Ok(manager.get_meeting_folder().map(|p| p.to_string_lossy().to_string()))
+        Ok(manager
+            .get_meeting_folder()
+            .map(|p| p.to_string_lossy().to_string()))
     } else {
         Ok(None)
     }
@@ -1234,7 +1029,8 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
 /// Get accumulated transcript segments from current recording session
 /// Used for syncing frontend state after page reload during active recording
 #[tauri::command]
-pub async fn get_transcript_history() -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
+pub async fn get_transcript_history(
+) -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
 
     if let Some(manager) = manager_guard.as_ref() {
@@ -1270,7 +1066,6 @@ pub async fn get_active_audio_output() -> Result<super::playback_monitor::AudioO
         .map_err(|e| format!("Failed to get audio output info: {}", e))
 }
 
-
 // ============================================================================
 // MIC HOT-SWAP (disconnect recovery)
 // ============================================================================
@@ -1278,11 +1073,13 @@ pub async fn get_active_audio_output() -> Result<super::playback_monitor::AudioO
 // Guard against concurrent mic hot-swap tasks. Only used by the disconnect
 // fallback path (trigger_mic_fallback_to_default) — the "chase the new
 // default" auto-swap has been removed.
-static MIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MIC_SWAP_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Bounded retry budget for the disconnect fallback (P1 #2). Counts COMPLETED
 // failed attempts; MIC_SWAP_IN_PROGRESS still prevents overlapping swaps.
-static MIC_FALLBACK_FAILED_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MIC_FALLBACK_FAILED_ATTEMPTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 const MAX_MIC_FALLBACK_ATTEMPTS: u32 = 3;
 
 /// Perform mic hot-swap using phased locking — never holds RECORDING_MANAGER during I/O
@@ -1298,9 +1095,12 @@ async fn perform_mic_hot_swap_task<R: Runtime>(
     match do_mic_swap(&new_device_name, session).await {
         Ok(()) => {
             info!("[HOT_SWAP] Mic switched to '{}'", new_device_name);
-            let _ = app.emit("mic-device-switched", serde_json::json!({
-                "device_name": new_device_name
-            }));
+            let _ = app.emit(
+                "mic-device-switched",
+                serde_json::json!({
+                    "device_name": new_device_name
+                }),
+            );
             Ok(())
         }
         Err(e) => {
@@ -1313,18 +1113,24 @@ async fn perform_mic_hot_swap_task<R: Runtime>(
             match do_mic_swap(&new_device_name, session).await {
                 Ok(()) => {
                     info!("[HOT_SWAP] Mic switched to '{}' on retry", new_device_name);
-                    let _ = app.emit("mic-device-switched", serde_json::json!({
-                        "device_name": new_device_name
-                    }));
+                    let _ = app.emit(
+                        "mic-device-switched",
+                        serde_json::json!({
+                            "device_name": new_device_name
+                        }),
+                    );
                     Ok(())
                 }
                 Err(e) => {
                     error!("[HOT_SWAP] Mic swap failed after retry: {}", e);
                     if session_live(session) {
-                        let _ = app.emit("mic-swap-failed", serde_json::json!({
-                            "error": e,
-                            "device_name": new_device_name
-                        }));
+                        let _ = app.emit(
+                            "mic-swap-failed",
+                            serde_json::json!({
+                                "error": e,
+                                "device_name": new_device_name
+                            }),
+                        );
                     }
                     Err(e)
                 }
@@ -1334,11 +1140,16 @@ async fn perform_mic_hot_swap_task<R: Runtime>(
 }
 
 /// Phased mic swap — lock is never held during async I/O.
-async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) -> Result<(), String> {
+async fn do_mic_swap(
+    device_name: &str,
+    session: &Arc<super::RecordingState>,
+) -> Result<(), String> {
     // Phase 1: Lock briefly — verify identity, take old stream OUT (no teardown under lock)
     let old_mic = {
         let mut guard = RECORDING_MANAGER.lock().unwrap();
-        let manager = guard.as_mut().ok_or_else(|| "Recording manager not available".to_string())?;
+        let manager = guard
+            .as_mut()
+            .ok_or_else(|| "Recording manager not available".to_string())?;
         if !manager.is_recording() {
             return Err("Recording stopped — aborting mic hot-swap".to_string());
         }
@@ -1355,7 +1166,10 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
     // teardown error/stall on the already-dead device must not abort the swap.
     if let Some(s) = old_mic {
         if let Err(e) = s.stop() {
-            warn!("[HOT_SWAP] Failed to stop old mic stream (proceeding): {}", e);
+            warn!(
+                "[HOT_SWAP] Failed to stop old mic stream (proceeding): {}",
+                e
+            );
         }
     }
 
@@ -1374,13 +1188,18 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
         super::DeviceType::Input,
     ));
 
-    info!("[HOT_SWAP] Creating new mic stream for '{}' (lock released)", device_name);
+    info!(
+        "[HOT_SWAP] Creating new mic stream for '{}' (lock released)",
+        device_name
+    );
     let new_stream = super::stream::AudioStream::create(
         device_arc.clone(),
         session.clone(),
         super::recording_state::DeviceType::Microphone,
         None,
-    ).await.map_err(|e| format!("Failed to create mic stream: {}", e))?;
+    )
+    .await
+    .map_err(|e| format!("Failed to create mic stream: {}", e))?;
 
     // Resolve the current default output OUTSIDE the lock — a CoreAudio stall here
     // must not block stop_recording (which needs RECORDING_MANAGER). (P1 #1)
@@ -1395,7 +1214,9 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
                 info!("[HOT_SWAP] Mic hot-swap to '{}' completed", device_name);
             }
             Some(_) => {
-                return Err("Session changed during hot-swap — discarding stale mic stream".to_string());
+                return Err(
+                    "Session changed during hot-swap — discarding stale mic stream".to_string(),
+                );
             }
             None => {
                 return Err("Recording manager gone during hot-swap".to_string());
@@ -1432,13 +1253,22 @@ fn spawn_device_event_processor<R: Runtime>(
         while let Some(event) = receiver.recv().await {
             // Skip if recording has stopped
             if !recording_live() {
-                info!("[DEVICE_EVENTS] Recording stopped — ignoring event: {:?}", event);
+                info!(
+                    "[DEVICE_EVENTS] Recording stopped — ignoring event: {:?}",
+                    event
+                );
                 continue;
             }
 
             match event {
-                DeviceEvent::DeviceDisconnected { ref device_name, ref device_type } => {
-                    info!("[DEVICE_EVENTS] Device disconnected: '{}' ({:?})", device_name, device_type);
+                DeviceEvent::DeviceDisconnected {
+                    ref device_name,
+                    ref device_type,
+                } => {
+                    info!(
+                        "[DEVICE_EVENTS] Device disconnected: '{}' ({:?})",
+                        device_name, device_type
+                    );
                     // The only automatic mid-recording mic change allowed:
                     // when the active microphone dies, fall back to the
                     // system default input. Triggered after the device
@@ -1452,7 +1282,10 @@ fn spawn_device_event_processor<R: Runtime>(
                         });
                     }
                 }
-                DeviceEvent::DeviceReconnected { ref device_name, ref device_type } => {
+                DeviceEvent::DeviceReconnected {
+                    ref device_name,
+                    ref device_type,
+                } => {
                     // Per product decision: once we have fallen back to the
                     // built-in mic we stay there for the rest of the meeting.
                     // This is intentional — just log and do nothing.
@@ -1536,7 +1369,10 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
     // emitting or spending the recovery budget here would fire against B with
     // A's device. Covers the default_input_device() error branch below.
     if !session_live(&session) {
-        info!("[MIC_FALLBACK] Session no longer live after wait — aborting fallback for '{}'", disconnected_name);
+        info!(
+            "[MIC_FALLBACK] Session no longer live after wait — aborting fallback for '{}'",
+            disconnected_name
+        );
         return;
     }
 
@@ -1599,7 +1435,10 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
                 return;
             }
             Err(e) => {
-                error!("[MIC_FALLBACK] Failed to re-query default input device: {}", e);
+                error!(
+                    "[MIC_FALLBACK] Failed to re-query default input device: {}",
+                    e
+                );
                 let _ = app.emit(
                     "mic-swap-failed",
                     serde_json::json!({
@@ -1665,7 +1504,10 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
     // Stop may have started during the sleeps above — bail before touching
     // the (possibly already taken) manager.
     if !session_live(&session) {
-        info!("[MIC_FALLBACK] Recording stopping — aborting fallback for '{}'", disconnected_name);
+        info!(
+            "[MIC_FALLBACK] Recording stopping — aborting fallback for '{}'",
+            disconnected_name
+        );
         return;
     }
 
@@ -1693,5 +1535,22 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
                 );
             }
         }
+    }
+}
+
+/// Update the live in-memory history only after the database checkpoint commits.
+pub(crate) fn remember_transcript(update: &TranscriptUpdate) {
+    let segment = super::recording_saver::TranscriptSegment {
+        id: format!("seg_{}", update.sequence_id),
+        text: update.text.clone(),
+        audio_start_time: update.audio_start_time,
+        audio_end_time: update.audio_end_time,
+        duration: update.duration,
+        display_time: update.timestamp.clone(),
+        confidence: update.confidence,
+        sequence_id: update.sequence_id,
+    };
+    if let Some(manager) = RECORDING_MANAGER.lock().unwrap().as_ref() {
+        manager.add_transcript_segment(segment);
     }
 }

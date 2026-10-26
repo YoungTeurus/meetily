@@ -4,6 +4,7 @@ import { useEffect, useState, useRef } from "react"
 import { Switch } from "./ui/switch"
 import { FolderOpen } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
+import { CallIntegrationSettings } from "./CallIntegrationSettings"
 import Analytics from "@/lib/analytics"
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
@@ -148,6 +149,7 @@ export function PreferenceSettings() {
 
   return (
     <div className="space-y-6">
+      <CallIntegrationSettings />
       {/* Notifications Section */}
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
         <div className="flex items-center justify-between">

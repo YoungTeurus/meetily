@@ -1,15 +1,15 @@
-use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as AsyncMutex;
 use anyhow::Result;
-use log::{info, warn, error};
-use tauri::{AppHandle, Runtime, Emitter};
-use tokio::sync::mpsc;
-use serde::{Serialize, Deserialize};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Runtime};
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 
-use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
 use super::incremental_saver::IncrementalAudioSaver;
+use super::recording_state::AudioChunk;
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,8 +18,8 @@ pub struct TranscriptSegment {
     pub text: String,
     pub audio_start_time: f64, // Seconds from recording start
     pub audio_end_time: f64,   // Seconds from recording start
-    pub duration: f64,          // Segment duration in seconds
-    pub display_time: String,   // Formatted time for display like "[02:15]"
+    pub duration: f64,         // Segment duration in seconds
+    pub display_time: String,  // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
 }
@@ -37,7 +37,7 @@ pub struct MeetingMetadata {
     pub audio_file: String,
     pub transcript_file: String,
     pub sample_rate: u32,
-    pub status: String,  // "recording", "completed", "error"
+    pub status: String, // "recording", "completed", "error"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +54,7 @@ pub struct RecordingSaver {
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
     is_saving: Arc<Mutex<bool>>,
+    accumulation_handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl RecordingSaver {
@@ -65,6 +66,7 @@ impl RecordingSaver {
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
             is_saving: Arc::new(Mutex::new(false)),
+            accumulation_handle: None,
         }
     }
 
@@ -94,18 +96,32 @@ impl RecordingSaver {
     pub fn add_transcript_segment(&self, segment: TranscriptSegment) {
         if let Ok(mut segments) = self.transcript_segments.lock() {
             // Check if segment with same sequence_id exists (update it)
-            if let Some(existing) = segments.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+            if let Some(existing) = segments
+                .iter_mut()
+                .find(|s| s.sequence_id == segment.sequence_id)
+            {
                 *existing = segment.clone();
-                info!("Updated transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
+                info!(
+                    "Updated transcript segment {} (seq: {}) - total segments: {}",
+                    segment.id,
+                    segment.sequence_id,
+                    segments.len()
+                );
             } else {
                 // New segment, add it
                 segments.push(segment.clone());
-                info!("Added new transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
+                info!(
+                    "Added new transcript segment {} (seq: {}) - total segments: {}",
+                    segment.id,
+                    segment.sequence_id,
+                    segments.len()
+                );
             }
         } else {
-            error!("Failed to lock transcript segments for adding segment {}", segment.id);
+            error!(
+                "Failed to lock transcript segments for adding segment {}",
+                segment.id
+            );
         }
 
         // NEW: Save incrementally to disk
@@ -139,57 +155,40 @@ impl RecordingSaver {
         &mut self,
         auto_save: bool,
         mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    ) {
+    ) -> Result<()> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
-            info!("Starting recording without audio saving (auto-save DISABLED - transcripts only)");
+            info!(
+                "Starting recording without audio saving (auto-save DISABLED - transcripts only)"
+            );
         }
 
         // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
         if auto_save {
             if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, true) {
-                    Ok(()) => info!("Successfully initialized meeting folder with checkpoints"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                        // Continue anyway - will use fallback flat structure
-                    }
-                }
+                self.initialize_meeting_folder(&name, true)?;
             }
         } else {
             // When auto_save is false, still create meeting folder for transcripts/metadata
             // but skip .checkpoints directory
             if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, false) {
-                    Ok(()) => info!("Successfully initialized meeting folder (transcripts only)"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                    }
-                }
+                self.initialize_meeting_folder(&name, false)?;
             }
         }
 
         // Start accumulation task
-        let is_saving_clone = self.is_saving.clone();
         let incremental_saver_arc = self.incremental_saver.clone();
         let save_audio = auto_save;
 
-        tokio::spawn(async move {
-            info!("Recording saver accumulation task started (save_audio: {})", save_audio);
+        self.accumulation_handle = Some(tokio::spawn(async move {
+            let mut failure = None;
+            info!(
+                "Recording saver accumulation task started (save_audio: {})",
+                save_audio
+            );
 
             while let Some(chunk) = receiver.recv().await {
-                // Check if we should continue
-                let should_continue = if let Ok(is_saving) = is_saving_clone.lock() {
-                    *is_saving
-                } else {
-                    false
-                };
-
-                if !should_continue {
-                    break;
-                }
-
                 // Only process audio chunks if auto_save is enabled
                 if save_audio {
                     // Add chunk to incremental saver
@@ -197,9 +196,11 @@ impl RecordingSaver {
                         let mut saver_guard = saver_arc.lock().await;
                         if let Err(e) = saver_guard.add_chunk(chunk) {
                             error!("Failed to add chunk to incremental saver: {}", e);
+                            failure = Some(e.to_string());
                         }
                     } else {
                         error!("Incremental saver not available while accumulating");
+                        failure = Some("Incremental audio saver unavailable".to_string());
                     }
                 } else {
                     // auto_save is false: discard audio chunk (no-op)
@@ -208,12 +209,17 @@ impl RecordingSaver {
             }
 
             info!("Recording saver accumulation task ended");
-        });
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }));
 
         // Set saving flag
         if let Ok(mut is_saving) = self.is_saving.lock() {
             *is_saving = true;
         }
+        Ok(())
     }
 
     /// Initialize meeting folder structure and metadata
@@ -221,7 +227,11 @@ impl RecordingSaver {
     /// # Arguments
     /// * `meeting_name` - Name of the meeting
     /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
-    fn initialize_meeting_folder(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
+    fn initialize_meeting_folder(
+        &mut self,
+        meeting_name: &str,
+        create_checkpoints: bool,
+    ) -> Result<()> {
         // Load preferences to get base recordings folder
         let base_folder = super::recording_preferences::get_default_recordings_folder();
 
@@ -232,7 +242,10 @@ impl RecordingSaver {
         if create_checkpoints {
             let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000)?;
             self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
-            info!("✅ Incremental audio saver initialized for meeting: {}", meeting_name);
+            info!(
+                "✅ Incremental audio saver initialized for meeting: {}",
+                meeting_name
+            );
         } else {
             info!("⚠️  Skipped incremental audio saver (auto-save disabled)");
         }
@@ -240,16 +253,20 @@ impl RecordingSaver {
         // Create initial metadata
         let metadata = MeetingMetadata {
             version: "1.0".to_string(),
-            meeting_id: None,  // Will be set by backend
+            meeting_id: None, // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
             duration_seconds: None,
             devices: DeviceInfo {
-                microphone: None,  // Could be enhanced to store actual device names
+                microphone: None, // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            audio_file: if create_checkpoints {
+                "audio.mp4".to_string()
+            } else {
+                "".to_string()
+            },
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
@@ -271,7 +288,7 @@ impl RecordingSaver {
 
         let json_string = serde_json::to_string_pretty(metadata)?;
         std::fs::write(&temp_path, json_string)?;
-        std::fs::rename(&temp_path, &metadata_path)?;  // Atomic
+        std::fs::rename(&temp_path, &metadata_path)?; // Atomic
 
         Ok(())
     }
@@ -286,48 +303,22 @@ impl RecordingSaver {
             return Err(anyhow::anyhow!("Failed to lock transcript segments"));
         };
 
-        info!("Writing {} transcript segments to JSON", segments_clone.len());
+        info!(
+            "Writing {} transcript segments to JSON",
+            segments_clone.len()
+        );
 
-        let transcript_path = folder.join("transcripts.json");
-        let temp_path = folder.join(".transcripts.json.tmp");
+        let mut dirty = true;
+        crate::control::recording::persistence::retry_transcript_file(
+            folder,
+            &segments_clone,
+            &mut dirty,
+        )?;
 
-        // Create JSON structure
-        let json = serde_json::json!({
-            "version": "1.0",
-            "segments": segments_clone,
-            "last_updated": chrono::Utc::now().to_rfc3339(),
-            "total_segments": segments_clone.len()
-        });
-
-        // Serialize to pretty JSON string
-        let json_string = serde_json::to_string_pretty(&json)
-            .map_err(|e| {
-                error!("Failed to serialize transcripts to JSON: {}", e);
-                anyhow::anyhow!("JSON serialization failed: {}", e)
-            })?;
-
-        // Write to temp file with error handling
-        std::fs::write(&temp_path, &json_string)
-            .map_err(|e| {
-                error!("Failed to write transcript temp file to {}: {}", temp_path.display(), e);
-                anyhow::anyhow!("Failed to write temp file: {}", e)
-            })?;
-
-        // Verify temp file was written correctly
-        if !temp_path.exists() {
-            error!("Temp transcript file does not exist after write: {}", temp_path.display());
-            return Err(anyhow::anyhow!("Temp file verification failed"));
-        }
-
-        // Atomic rename
-        std::fs::rename(&temp_path, &transcript_path)
-            .map_err(|e| {
-                error!("Failed to rename transcript file from {} to {}: {}",
-                       temp_path.display(), transcript_path.display(), e);
-                anyhow::anyhow!("Failed to rename transcript file: {}", e)
-            })?;
-
-        info!("✅ Successfully wrote transcripts.json with {} segments", segments_clone.len());
+        info!(
+            "✅ Successfully wrote transcripts.json with {} segments",
+            segments_clone.len()
+        );
         Ok(())
     }
 
@@ -352,24 +343,36 @@ impl RecordingSaver {
     pub async fn stop_and_save<R: Runtime>(
         &mut self,
         app: &AppHandle<R>,
-        recording_duration: Option<f64>
+        recording_duration: Option<f64>,
     ) -> Result<Option<String>, String> {
         info!("Stopping recording saver");
 
-        // Stop accumulation
+        // The pipeline closes its recording channel after its final mixed chunk.
+        // Join the consumer instead of discarding queued audio after a fixed delay.
+        if let Some(handle) = self.accumulation_handle.take() {
+            handle
+                .await
+                .map_err(|e| format!("Audio saver task failed: {e}"))??;
+        }
         if let Ok(mut is_saving) = self.is_saving.lock() {
             *is_saving = false;
         }
-
-        // Give time for final chunks
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Check if incremental saver exists (indicates auto_save was enabled)
         let should_save_audio = self.incremental_saver.is_some();
 
         if !should_save_audio {
-            info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
-            info!("✅ Transcripts and metadata already saved incrementally");
+            if let Some(folder) = &self.meeting_folder {
+                self.write_transcripts_json(folder)
+                    .map_err(|e| e.to_string())?;
+                if let Some(mut metadata) = self.metadata.clone() {
+                    metadata.status = "completed".to_string();
+                    metadata.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    metadata.duration_seconds = recording_duration;
+                    self.write_metadata(folder, &metadata)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             return Ok(None);
         }
 
@@ -401,10 +404,16 @@ impl RecordingSaver {
             // Verify transcripts were written correctly
             let transcript_path = folder.join("transcripts.json");
             if !transcript_path.exists() {
-                error!("❌ Transcript file was not created at: {}", transcript_path.display());
+                error!(
+                    "❌ Transcript file was not created at: {}",
+                    transcript_path.display()
+                );
                 return Err("Transcript file verification failed".to_string());
             }
-            info!("✅ Transcripts saved and verified at: {}", transcript_path.display());
+            info!(
+                "✅ Transcripts saved and verified at: {}",
+                transcript_path.display()
+            );
         }
 
         // Update metadata to completed status with actual recording duration
@@ -427,7 +436,10 @@ impl RecordingSaver {
                 return Err(format!("Failed to update metadata: {}", e));
             }
 
-            info!("✅ Metadata updated with duration: {:?}s", metadata.duration_seconds);
+            info!(
+                "✅ Metadata updated with duration: {:?}s",
+                metadata.duration_seconds
+            );
         }
 
         // Emit save event with audio and transcript paths

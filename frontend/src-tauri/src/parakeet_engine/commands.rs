@@ -73,6 +73,13 @@ pub async fn parakeet_load_model<R: Runtime>(
     app_handle: AppHandle<R>,
     model_name: String
 ) -> Result<(), String> {
+    // Public settings commands share the offline/live boundary. Internal engine
+    // methods remain unguarded because capture and batch jobs already own it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
@@ -177,6 +184,13 @@ pub async fn parakeet_has_available_models() -> Result<bool, String> {
 
 #[command]
 pub async fn parakeet_validate_model_ready() -> Result<String, String> {
+    // Validation may auto-load a model, so the public command must own the
+    // same mutation boundary. Internal *_with_config helpers already have it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
@@ -518,6 +532,13 @@ pub async fn parakeet_retry_download<R: Runtime>(
 
 #[command]
 pub async fn parakeet_delete_corrupted_model(model_name: String) -> Result<String, String> {
+    // Public settings commands share the offline/live boundary. Internal engine
+    // methods remain unguarded because capture and batch jobs already own it.
+    let _batch_guard = crate::control::recording::reserve_batch().map_err(|_| {
+        "Cannot change recognition models while recording or processing audio".to_string()
+    })?;
+    let _engine_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let engine = {
         let guard = PARAKEET_ENGINE.lock().unwrap();
         guard.as_ref().cloned()

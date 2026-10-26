@@ -12,6 +12,41 @@ pub struct SaveModelConfigRequest {
     pub api_key: Option<String>,
     #[serde(rename = "ollamaEndpoint")]
     pub ollama_endpoint: Option<String>,
+    #[serde(rename = "codexBinaryPath", default)]
+    pub codex_binary_path: Option<String>,
+}
+
+#[cfg(test)]
+mod codex_config_tests {
+    use super::*;
+
+    async fn database() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn codex_path_round_trip_preserves_omitted_path_and_clears_explicit_empty() {
+        let pool = database().await;
+        SettingsRepository::save_model_config_with_codex(&pool, "codex-cli", "", "large-v3", None, Some(" /opt/homebrew/bin/codex ")).await.unwrap();
+        let config = SettingsRepository::get_model_config(&pool).await.unwrap().unwrap();
+        assert_eq!(config.codex_binary_path.as_deref(), Some("/opt/homebrew/bin/codex"));
+        assert_eq!(config.model, "");
+        assert_eq!(SettingsRepository::get_api_key(&pool, "codex-cli").await.unwrap(), None);
+        SettingsRepository::save_model_config(&pool, "ollama", "local", "large-v3", None).await.unwrap();
+        assert_eq!(SettingsRepository::get_model_config(&pool).await.unwrap().unwrap().codex_binary_path, config.codex_binary_path);
+        SettingsRepository::save_model_config_with_codex(&pool, "codex-cli", "", "large-v3", None, Some("")).await.unwrap();
+        assert_eq!(SettingsRepository::get_model_config(&pool).await.unwrap().unwrap().codex_binary_path, None);
+    }
+
+    #[tokio::test]
+    async fn invalid_binary_path_does_not_partially_change_model_configuration() {
+        let pool = database().await;
+        SettingsRepository::save_model_config(&pool, "ollama", "local", "large-v3", None).await.unwrap();
+        assert!(SettingsRepository::save_model_config_with_codex(&pool, "codex-cli", "", "large-v3", None, Some("bad\0path")).await.is_err());
+        assert_eq!(SettingsRepository::get_model_config(&pool).await.unwrap().unwrap().provider, "ollama");
+    }
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -45,22 +80,43 @@ impl SettingsRepository {
         whisper_model: &str,
         ollama_endpoint: Option<&str>,
     ) -> std::result::Result<(), sqlx::Error> {
+        Self::save_model_config_with_codex(pool, provider, model, whisper_model, ollama_endpoint, None).await
+    }
+
+    /// Missing path preserves the saved value. An explicitly empty path resets
+    /// discovery to the installed CLI, without affecting other provider settings.
+    pub async fn save_model_config_with_codex(
+        pool: &SqlitePool,
+        provider: &str,
+        model: &str,
+        whisper_model: &str,
+        ollama_endpoint: Option<&str>,
+        codex_binary_path: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        if codex_binary_path.is_some_and(|p| p.contains('\0') || p.len() > 4096) {
+            return Err(sqlx::Error::Protocol("Invalid Codex CLI binary path".into()));
+        }
+        let update_codex_path = codex_binary_path.is_some();
+        let codex_binary_path = codex_binary_path.map(str::trim).filter(|p| !p.is_empty());
         // Using id '1' for backward compatibility
         sqlx::query(
             r#"
-            INSERT INTO settings (id, provider, model, whisperModel, ollamaEndpoint)
-            VALUES ('1', $1, $2, $3, $4)
+            INSERT INTO settings (id, provider, model, whisperModel, ollamaEndpoint, codexBinaryPath)
+            VALUES ('1', $1, $2, $3, $4, $5)
             ON CONFLICT(id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
                 whisperModel = excluded.whisperModel,
-                ollamaEndpoint = excluded.ollamaEndpoint
+                ollamaEndpoint = excluded.ollamaEndpoint,
+                codexBinaryPath = CASE WHEN $6 THEN excluded.codexBinaryPath ELSE settings.codexBinaryPath END
             "#,
         )
         .bind(provider)
         .bind(model)
         .bind(whisper_model)
         .bind(ollama_endpoint)
+        .bind(codex_binary_path)
+        .bind(update_codex_path)
         .execute(pool)
         .await?;
 
@@ -85,7 +141,7 @@ impl SettingsRepository {
             "ollama" => "ollamaApiKey",
             "groq" => "groqApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(()), // No API key needed
+            "builtin-ai" | "codex-cli" => return Ok(()), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -123,7 +179,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(None), // No API key needed
+            "builtin-ai" | "codex-cli" => return Ok(None), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),

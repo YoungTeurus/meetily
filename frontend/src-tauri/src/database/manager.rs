@@ -151,7 +151,16 @@ impl DatabaseManager {
             target_legacy_path.display()
         );
 
-        fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+        // Imports are explicit and only target an unused fork data directory.
+        // A live source is snapshotted using SQLite, including committed WAL pages.
+        if app_data_dir.join("meeting_minutes.sqlite").exists() || target_legacy_path.exists() {
+            return Err(sqlx::Error::Protocol("Import requires a fresh preview data directory; existing data is never overwritten".into()));
+        }
+        let backup = app_data_dir.join(format!("import-backup-{}.sqlite", uuid::Uuid::new_v4()));
+        meetily_local_control::import::snapshot_for_import(
+            Path::new(legacy_db_path), &backup, 20260930030000,
+        ).await.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        fs::copy(&backup, &target_legacy_path).map_err(sqlx::Error::Io)?;
 
         // Now use the standard initialization which will detect and migrate the legacy db
         Self::new_from_app_handle(app_handle).await

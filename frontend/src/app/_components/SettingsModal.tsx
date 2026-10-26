@@ -1,4 +1,4 @@
-import { ModelConfig } from "@/components/ModelSettingsModal";
+import { SummaryModelSettings } from "@/components/SummaryModelSettings";
 import { PreferenceSettings } from "@/components/PreferenceSettings";
 import { DeviceSelection } from "@/components/DeviceSelection";
 import { LanguageSelection } from "@/components/LanguageSelection";
@@ -82,74 +82,7 @@ export function SettingsModals({
             {/* General Preferences Section */}
             <PreferenceSettings />
 
-            {/* Divider */}
-            <div className="border-t pt-8">
-              <h4 className="text-lg font-semibold text-gray-900 mb-4">AI Model Configuration</h4>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Summarization Model
-                  </label>
-                  <div className="flex space-x-2">
-                    <select
-                      className="px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                      value={modelConfig.provider}
-                      onChange={(e) => {
-                        const provider = e.target.value as ModelConfig['provider'];
-                        setModelConfig({
-                          ...modelConfig,
-                          provider,
-                          model: modelOptions[provider][0]
-                        });
-                      }}
-                    >
-                      <option value="builtin-ai">Built-in AI</option>
-                      <option value="claude">Claude</option>
-                      <option value="groq">Groq</option>
-                      <option value="ollama">Ollama</option>
-                      <option value="openrouter">OpenRouter</option>
-                      <option value="openai">OpenAI</option>
-                    </select>
-
-                    <select
-                      className="flex-1 px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                      value={modelConfig.model}
-                      onChange={(e) => setModelConfig((prev: ModelConfig) => ({ ...prev, model: e.target.value }))}
-                    >
-                      {modelOptions[modelConfig.provider].map((model: string) => (
-                        <option key={model} value={model}>
-                          {model}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-                {modelConfig.provider === 'ollama' && (
-                  <div>
-                    <h4 className="text-lg font-bold mb-4">Available Ollama Models</h4>
-                    {error && (
-                      <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-                        {error}
-                      </div>
-                    )}
-                    <div className="grid gap-4 max-h-[400px] overflow-y-auto pr-2">
-                      {models.map((model) => (
-                        <div
-                          key={model.id}
-                          className={`bg-white p-4 rounded-lg shadow cursor-pointer transition-colors ${modelConfig.model === model.name ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-50'
-                            }`}
-                          onClick={() => setModelConfig((prev: ModelConfig) => ({ ...prev, model: model.name }))}
-                        >
-                          <h3 className="font-bold">{model.name}</h3>
-                          <p className="text-gray-600">Size: {model.size}</p>
-                          <p className="text-gray-600">Modified: {model.modified}</p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
+            <SummaryModelSettings />
           </div>
 
           {/* Footer */}

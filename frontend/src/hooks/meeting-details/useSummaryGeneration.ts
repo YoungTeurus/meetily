@@ -1,3 +1,4 @@
+import { meetingNotesService } from '@/services/meetingNotesService';
 import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   CancelSummaryResponse,
@@ -361,6 +362,9 @@ export function useSummaryGeneration({
         return;
       }
 
+      // Persist even a just-typed/debounced draft before the backend snapshots notes.
+      await meetingNotesService.flush(meeting.id);
+      if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || generationId !== generationIdRef.current) return;
       const result = await invokeTauri<ProcessTranscriptResponse>('api_process_transcript', {
         text: transcriptText,
         model: modelConfig.provider,

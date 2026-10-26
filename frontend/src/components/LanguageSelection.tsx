@@ -133,7 +133,7 @@ export function LanguageSelection({
   // Parakeet only supports auto-detection (doesn't support manual language selection)
   const isParakeet = provider === 'parakeet';
   const availableLanguages = isParakeet
-    ? LANGUAGES.filter(lang => lang.code === 'auto' || lang.code === 'auto-translate')
+    ? LANGUAGES.filter(lang => lang.code === 'auto')
     : LANGUAGES;
 
   const handleLanguageChange = async (languageCode: string) => {
@@ -169,7 +169,7 @@ export function LanguageSelection({
   };
 
   // Find the selected language name for display
-  const selectedLanguageName = LANGUAGES.find(
+  const selectedLanguageName = isParakeet ? 'Автоопределение (Parakeet)' : LANGUAGES.find(
     lang => lang.code === selectedLanguage
   )?.name || 'Auto Detect (Original Language)';
 
@@ -184,7 +184,7 @@ export function LanguageSelection({
 
       <div className="space-y-2">
         <select
-          value={selectedLanguage}
+          value={isParakeet ? 'auto' : selectedLanguage}
           onChange={(e) => handleLanguageChange(e.target.value)}
           disabled={disabled || saving}
           className="w-full px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-50 disabled:text-gray-500"
@@ -210,19 +210,19 @@ export function LanguageSelection({
           <p className="text-gray-600">
             <strong>Current:</strong> {selectedLanguageName}
           </p>
-          {selectedLanguage === 'auto' && (
+          {!isParakeet && selectedLanguage === 'auto' && (
             <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-yellow-800">
               <p className="font-medium">⚠️ Auto Detect may produce incorrect results</p>
               <p className="mt-1">For best accuracy, select your specific language (e.g., English, Spanish, etc.)</p>
             </div>
           )}
-          {selectedLanguage === 'auto-translate' && (
+          {!isParakeet && selectedLanguage === 'auto-translate' && (
             <div className="p-2 bg-blue-50 border border-blue-200 rounded text-blue-800">
               <p className="font-medium">🌐 Translation Mode Active</p>
               <p className="mt-1">All audio will be automatically translated to English. Best for multilingual meetings where you need English output.</p>
             </div>
           )}
-          {selectedLanguage !== 'auto' && selectedLanguage !== 'auto-translate' && (
+          {!isParakeet && selectedLanguage !== 'auto' && selectedLanguage !== 'auto-translate' && (
             <p className="text-gray-600">
               Transcription will be optimized for <strong>{selectedLanguageName}</strong>
             </p>

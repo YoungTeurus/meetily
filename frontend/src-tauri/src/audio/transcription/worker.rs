@@ -9,7 +9,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -20,7 +20,11 @@ static SPEECH_DETECTED_EMITTED: AtomicBool = AtomicBool::new(false);
 /// Reset the speech detected flag for a new recording session
 pub fn reset_speech_detected_flag() {
     SPEECH_DETECTED_EMITTED.store(false, Ordering::SeqCst);
-    info!("🔍 SPEECH_DETECTED_EMITTED reset to: {}", SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst));
+    SEQUENCE_COUNTER.store(0, Ordering::SeqCst);
+    info!(
+        "🔍 SPEECH_DETECTED_EMITTED reset to: {}",
+        SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst)
+    );
 }
 
 /// Returns true if the transcript text is non-trivial and should be emitted.
@@ -41,7 +45,7 @@ pub struct TranscriptUpdate {
     // NEW: Recording-relative timestamps for playback sync
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
-    pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    pub duration: f64,         // Segment duration in seconds (e.g., 3.3)
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -56,10 +60,14 @@ pub fn start_transcription_task<R: Runtime>(
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
 
         // Initialize transcription engine (Whisper or Parakeet based on config)
-        let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
+        let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await
+        {
             Ok(engine) => engine,
             Err(e) => {
                 error!("Failed to initialize transcription engine: {}", e);
+                crate::control::recording::mark_failed(format!(
+                    "Transcription initialization failed: {e}"
+                ));
                 let _ = app.emit("transcription-error", serde_json::json!({
                     "error": e,
                     "userMessage": "Recording failed: Unable to initialize speech recognition. Please check your model settings.",
@@ -80,7 +88,11 @@ pub fn start_transcription_task<R: Runtime>(
         let chunks_completed = Arc::new(AtomicU64::new(0));
         let input_finished = Arc::new(AtomicBool::new(false));
 
-        info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
+        info!(
+            "📊 Starting {} transcription worker{} (serial mode for ordered emission)",
+            NUM_WORKERS,
+            if NUM_WORKERS == 1 { "" } else { "s" }
+        );
 
         // Spawn worker tasks
         let mut worker_handles = Vec::new();
@@ -114,7 +126,10 @@ pub fn start_transcription_task<R: Runtime>(
                         worker_id, engine_name, current_model
                     );
                 } else {
-                    warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
+                    warn!(
+                        "⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped",
+                        worker_id, engine_name
+                    );
                 }
 
                 loop {
@@ -142,7 +157,10 @@ pub fn start_transcription_task<R: Runtime>(
                             // Check if model is still loaded before processing
                             if !engine_clone.is_model_loaded().await {
                                 warn!("⚠️ Worker {}: Model unloaded, but continuing to preserve chunk {}", worker_id, chunk.chunk_id);
-                                // Still count as completed even if we can't process
+                                crate::control::recording::mark_failed(
+                                    "Transcription model unloaded before chunk processing".into(),
+                                );
+                                // Count as completed but prevent false finalization
                                 chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             }
@@ -151,12 +169,8 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
                             // Transcribe with provider-agnostic approach
-                            match transcribe_chunk_with_provider(
-                                &engine_clone,
-                                chunk,
-                                &app_clone,
-                            )
-                            .await
+                            match transcribe_chunk_with_provider(&engine_clone, chunk, &app_clone)
+                                .await
                             {
                                 Ok((transcript, confidence_opt, is_partial)) => {
                                     let confidence_str = match confidence_opt {
@@ -174,7 +188,8 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Emit speech-detected event for frontend UX (only on first detection per session)
                                         // This is lightweight and provides better user feedback
-                                        let current_flag = SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
+                                        let current_flag =
+                                            SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
                                         info!("🔍 Checking speech-detected flag: current={}, will_emit={}", current_flag, !current_flag);
 
                                         if !current_flag {
@@ -190,7 +205,8 @@ pub fn start_transcription_task<R: Runtime>(
                                         }
 
                                         // Generate sequence ID and calculate timestamps FIRST
-                                        let sequence_id = SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                        let sequence_id =
+                                            SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
                                         let audio_start_time = chunk_timestamp; // Already in seconds from recording start
                                         let audio_end_time = chunk_timestamp + chunk_duration;
 
@@ -217,6 +233,18 @@ pub fn start_transcription_task<R: Runtime>(
                                             duration: chunk_duration,
                                         };
 
+                                        if let Err(error) = crate::control::recording::checkpoint(
+                                            &app_clone, &update,
+                                        )
+                                        .await
+                                        {
+                                            error!(
+                                                "Transcript checkpoint failed: {}",
+                                                error.message
+                                            );
+                                            chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
+                                            continue;
+                                        }
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
                                         {
                                             error!(
@@ -237,13 +265,22 @@ pub fn start_transcription_task<R: Runtime>(
                                             continue;
                                         }
                                         TranscriptionError::ModelNotLoaded => {
-                                            warn!("Worker {}: Model unloaded during transcription", worker_id);
+                                            warn!(
+                                                "Worker {}: Model unloaded during transcription",
+                                                worker_id
+                                            );
+                                            crate::control::recording::mark_failed(e.to_string());
                                             chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                             continue;
                                         }
                                         _ => {
-                                            warn!("Worker {}: Transcription failed: {}", worker_id, e);
-                                            let _ = app_clone.emit("transcription-warning", e.to_string());
+                                            warn!(
+                                                "Worker {}: Transcription failed: {}",
+                                                worker_id, e
+                                            );
+                                            crate::control::recording::mark_failed(e.to_string());
+                                            let _ = app_clone
+                                                .emit("transcription-warning", e.to_string());
                                         }
                                     }
                                 }
@@ -323,6 +360,9 @@ pub fn start_transcription_task<R: Runtime>(
 
             if let Err(_) = work_sender.send(chunk) {
                 error!("❌ Failed to send chunk to workers - this should not happen!");
+                crate::control::recording::mark_failed(
+                    "Transcription worker channel closed".into(),
+                );
                 break;
             }
         }
@@ -345,6 +385,7 @@ pub fn start_transcription_task<R: Runtime>(
         for (worker_id, handle) in worker_handles.into_iter().enumerate() {
             if let Err(e) = handle.await {
                 error!("❌ Worker {} panicked: {:?}", worker_id, e);
+                crate::control::recording::mark_failed(format!("Transcription worker failed: {e}"));
             } else {
                 info!("✅ Worker {} completed successfully", worker_id);
             }
@@ -439,9 +480,17 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
         TranscriptionEngine::Whisper(whisper_engine) => {
             // Get language preference from global state
             let language = crate::get_language_preference_internal();
+            let initial_prompt = {
+                let state = app.try_state::<crate::state::AppState>()
+                    .ok_or_else(|| TranscriptionError::EngineFailed("App state unavailable for vocabulary hints".into()))?;
+                let vocabulary = crate::database::repositories::vocabulary::VocabularyRepository::get_global(
+                    state.db_manager.pool(),
+                ).await.map_err(|error| TranscriptionError::EngineFailed(format!("Unable to load vocabulary hints: {error}")))?;
+                crate::database::repositories::vocabulary::VocabularyRepository::merge(None, vocabulary.as_deref())
+            };
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
+                .transcribe_audio_with_confidence_and_prompt(speech_samples, language, initial_prompt.as_deref())
                 .await
             {
                 Ok((text, confidence, is_partial)) => {
@@ -588,21 +637,21 @@ fn format_recording_time(seconds: f64) -> String {
     let secs = total_seconds % 60;
 
     format!("[{:02}:{:02}]", minutes, secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_short_acknowledgements() {
+        assert!(should_emit_transcript("Yes"));
+        assert!(should_emit_transcript("ok"));
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn keeps_short_acknowledgements() {
-            assert!(should_emit_transcript("Yes"));
-            assert!(should_emit_transcript("ok"));
-        }
-
-        #[test]
-        fn drops_empty_and_whitespace_only() {
-            assert!(!should_emit_transcript(""));
-            assert!(!should_emit_transcript("   "));
-        }
+    #[test]
+    fn drops_empty_and_whitespace_only() {
+        assert!(!should_emit_transcript(""));
+        assert!(!should_emit_transcript("   "));
     }
+}

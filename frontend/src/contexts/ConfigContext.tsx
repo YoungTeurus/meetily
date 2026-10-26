@@ -214,18 +214,17 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     loadTranscriptConfig();
   }, []);
 
-  // Sync language preference to Rust on mount (fixes startup desync bug)
+  // Native persisted settings are authoritative for GUI, tray and integrations.
   useEffect(() => {
-    if (selectedLanguage) {
-      invoke('set_language_preference', { language: selectedLanguage })
-        .then(() => {
-          console.log('[ConfigContext] Synced language preference to Rust on startup:', selectedLanguage);
-        })
-        .catch(err => {
-          console.error('[ConfigContext] Failed to sync language preference to Rust on startup:', err);
-        });
-    }
-  }, []); 
+    let active = true;
+    void invoke<string>('get_language_preference').then(language => {
+      if (active) setSelectedLanguage(language);
+    }).catch(error => console.error('Failed to load transcription language:', error));
+    void invoke<{ preferred_mic_device: string | null; preferred_system_device: string | null }>('get_recording_preferences').then(preferences => {
+      if (active) setSelectedDevices({ micDevice: preferences.preferred_mic_device, systemDevice: preferences.preferred_system_device });
+    }).catch(error => console.error('Failed to load recording devices:', error));
+    return () => { active = false; };
+  }, []);
 
   // Load model configuration on mount
   useEffect(() => {
@@ -275,9 +274,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
           setModelConfig(prev => ({
             ...prev,
             provider: data.provider,
-            model: data.model || prev.model,
+            model: data.provider === 'codex-cli' ? (data.model ?? '') : (data.model || prev.model),
             whisperModel: data.whisperModel || prev.whisperModel,
             ollamaEndpoint: data.ollamaEndpoint,
+            codexBinaryPath: data.codexBinaryPath,
           }));
 
           // Seed per-provider model cache from DB
@@ -347,25 +347,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // Load device preferences on mount
-  useEffect(() => {
-    const loadDevicePreferences = async () => {
-      try {
-        const prefs = await configService.getRecordingPreferences();
-        if (prefs && (prefs.preferred_mic_device || prefs.preferred_system_device)) {
-          setSelectedDevices({
-            micDevice: prefs.preferred_mic_device,
-            systemDevice: prefs.preferred_system_device
-          });
-          console.log('Loaded device preferences:', prefs);
-        }
-      } catch (error) {
-        console.log('No device preferences found or failed to load:', error);
-      }
-    };
-    loadDevicePreferences();
-  }, []);
-
   // Calculate model options based on available models
   const modelOptions: Record<ModelConfig['provider'], string[]> = {
     ollama: models.map(model => model.name),
@@ -375,6 +356,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
     'builtin-ai': [],
     'custom-openai': [],
+    'codex-cli': [],
   };
 
   // Toggle confidence indicator with localStorage persistence
@@ -487,6 +469,17 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  const deviceSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const handleSetSelectedDevices = useCallback((devices: SelectedDevices) => {
+    setSelectedDevices(devices);
+    deviceSaveQueue.current = deviceSaveQueue.current.catch(() => {}).then(async () => {
+      const preferences = await invoke<Record<string, unknown>>('get_recording_preferences');
+      await invoke('set_recording_preferences', { preferences: {
+        ...preferences, preferred_mic_device: devices.micDevice, preferred_system_device: devices.systemDevice,
+      } });
+    }).catch(error => console.error('Failed to save recording devices:', error));
+  }, []);
+
   const value: ConfigContextType = useMemo(() => ({
     modelConfig,
     setModelConfig,
@@ -498,7 +491,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     transcriptModelConfig,
     setTranscriptModelConfig,
     selectedDevices,
-    setSelectedDevices,
+    setSelectedDevices: handleSetSelectedDevices,
     selectedLanguage,
     setSelectedLanguage: handleSetSelectedLanguage,
     showConfidenceIndicator,
@@ -524,6 +517,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     selectedDevices,
     selectedLanguage,
     handleSetSelectedLanguage,
+    handleSetSelectedDevices,
     showConfidenceIndicator,
     toggleConfidenceIndicator,
     betaFeatures,

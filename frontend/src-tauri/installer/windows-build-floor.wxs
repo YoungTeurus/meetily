@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- Keep the search, launch condition and referenced group in one linked section. -->
+    <Property Id="MEETILY_WINDOWS_BUILD" Secure="yes">
+      <RegistrySearch Id="MeetilyWindowsBuildSearch" Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        Name="CurrentBuildNumber" Type="raw" Win64="yes" />
+    </Property>
+    <Condition Message="Meetily Calls Preview requires Windows 10 version 2004 (build 19041) or newer, or Windows 11. Update Windows before installing.">
+      Installed OR (VersionNT64 AND MEETILY_WINDOWS_BUILD &gt;= 19041)
+    </Condition>
+    <FeatureGroup Id="MeetilyWindowsBuildFloor">
+      <Feature Id="MeetilyWindowsCompatibility" Title="Windows compatibility" Level="1" Display="hidden" />
+    </FeatureGroup>
+  </Fragment>
+</Wix>

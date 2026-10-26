@@ -1,113 +1,47 @@
 import React, { useEffect, useState } from 'react';
-import { Info } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
 import { OnboardingContainer } from '../OnboardingContainer';
 import { useOnboarding } from '@/contexts/OnboardingContext';
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 
 export function SetupOverviewStep() {
-  const { goNext } = useOnboarding();
+  const { goToStep, databaseExists, setDatabaseExists } = useOnboarding();
   const [isMac, setIsMac] = useState(false);
-
+  const [checking, setChecking] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
   useEffect(() => {
-    const checkPlatform = async () => {
-      try {
-        const { platform } = await import('@tauri-apps/plugin-os');
-        setIsMac(platform() === 'macos');
-      } catch (e) {
-        setIsMac(navigator.userAgent.includes('Mac'));
+    let active = true;
+    void import('@tauri-apps/plugin-os').then(({ platform }) => { if (active) setIsMac(platform() === 'macos'); }).catch(() => {});
+    void invoke<boolean>('check_first_launch').then(firstLaunch => { if (active) setDatabaseExists(!firstLaunch); }).catch(cause => { if (active) setError(String(cause)); }).finally(() => { if (active) setChecking(false); });
+    return () => { active = false; };
+  }, [setDatabaseExists]);
+
+  const chooseDatabase = async (mode: 'fresh' | 'import') => {
+    if (busy || checking) return;
+    setBusy(true); setError('');
+    try {
+      if (mode === 'import') {
+        const selected = await invoke<string | null>('select_legacy_database_path');
+        if (!selected) return;
+        await invoke('import_and_initialize_database', { legacyDbPath: selected });
+      } else {
+        await invoke('initialize_fresh_database');
       }
-    };
-    checkPlatform();
-  }, []);
-
-  const steps = [
-    {
-      number: 1,
-      type: 'transcription',
-      title: 'Download Transcription Engine',
-    },
-    {
-      number: 2,
-      type: 'summarization',
-      title: 'Download Summarization Engine',
-    },
-  ];
-
-  const handleContinue = () => {
-    goNext();
+      setDatabaseExists(true);
+      goToStep(3);
+    } catch (cause) { setError(String(cause)); }
+    finally { setBusy(false); }
   };
-
-  return (
-    <OnboardingContainer
-      title="Setup Overview"
-      description="Meetily requires that you download the Transcription & Summarization AI models for the software to work."
-      step={2}
-      totalSteps={isMac ? 4 : 3}
-    >
-      <div className="flex flex-col items-center space-y-10">
-        {/* Steps Card */}
-        <div className="w-full max-w-md bg-white rounded-lg border border-gray-200 p-4">
-          <div className="space-y-4">
-            {steps.map((step, idx) => {
-              return (
-                <div
-                  key={step.number}
-                  className={`flex items-start gap-4 p-1`}
-                >
-                  <div className="flex-1 ml-1">
-                    <h3 className="font-medium text-gray-900 flex items-center gap-2">
-                        Step {step.number} :  {step.title}
-
-                        {step.type === "summarization" && (
-                            <TooltipProvider>
-                            <Tooltip>
-                                <TooltipTrigger asChild>
-                                <button className="text-gray-400 hover:text-gray-600">
-                                    <Info className="w-4 h-4" />
-                                </button>
-                                </TooltipTrigger>
-                                <TooltipContent className="max-w-xs text-sm">
-                                You can also select external AI providers like OpenAI, Claude, or
-                                Ollama for summary generation in settings.
-                                </TooltipContent>
-                            </Tooltip>
-                            </TooltipProvider>
-                        )}
-                        </h3>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-
-        {/* CTA Section */}
-        <div className="w-full max-w-xs space-y-4">
-          <Button
-            onClick={handleContinue}
-            className="w-full h-11 bg-gray-900 hover:bg-gray-800 text-white"
-          >
-            Let's Go
-          </Button>
-          <div className="text-center">
-            <a
-              href="https://github.com/Zackriya-Solutions/meeting-minutes"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs text-gray-600 hover:underline"
-            >
-              Report issues on GitHub
-            </a>
-          </div>
-        </div>
+  return <OnboardingContainer title="Настройка Meetily" description="Для записи и транскрипта нужен только движок распознавания. Движок конспектов и API-ключи необязательны." step={2} totalSteps={isMac ? 4 : 3}>
+    <div className="mx-auto w-full max-w-lg space-y-6">
+      <div className="rounded-lg border bg-white p-5 text-sm space-y-3">
+        <h2 className="font-semibold">Локальное хранилище встреч</h2>
+        {checking ? <p>Проверяем хранилище…</p> : databaseExists ? <p>Хранилище этой установки готово. Существующие встречи сохраняются.</p> : <><p>Создайте новое хранилище или явно выберите файл базы из прежней установки Meetily.</p><p className="text-gray-600">Импорт создаёт копию. Исходный файл не изменяется. Эта установка использует отдельную папку данных.</p><div className="flex flex-wrap gap-3"><Button disabled={busy} onClick={() => void chooseDatabase('fresh')}>{busy ? 'Подождите…' : 'Создать новое хранилище'}</Button><Button variant="outline" disabled={busy} onClick={() => void chooseDatabase('import')}>Импортировать базу Meetily</Button></div></>}
       </div>
-    </OnboardingContainer>
-  );
+      {error && <p role="alert" className="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-800">{error}</p>}
+      <p className="text-sm text-gray-600">Затем скачаем движок распознавания. Для русского с фиксированным языком после настройки можно выбрать Whisper и язык ru; Parakeet использует автоопределение.</p>
+      {databaseExists && <Button disabled={busy || checking} onClick={() => goToStep(3)}>Продолжить</Button>}
+    </div>
+  </OnboardingContainer>;
 }

@@ -1,0 +1,26 @@
+[package]
+name = "meetilyctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Local Meetily control CLI and read-first MCP bridge"
+
+# Independent from Tauri's native audio dependencies.
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rmcp = { version = "3.5.0", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
+
+[dev-dependencies]
+rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-child-process"] }
+tempfile = "3"
+meetily-local-control = { path = "../local-control" }
+axum = "0.8"
+async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

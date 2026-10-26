@@ -7,6 +7,8 @@ import { Label } from './ui/label';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { AutomaticRetranscriptionSettings } from './AutomaticRetranscriptionSettings';
+import { WhisperVocabularySettings } from './WhisperVocabularySettings';
 
 
 export interface TranscriptModelProps {
@@ -172,6 +174,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         </div>
                     )}
 
+
+                    <AutomaticRetranscriptionSettings />
+                    <WhisperVocabularySettings />
 
                     {requiresApiKey && (
                         <div>

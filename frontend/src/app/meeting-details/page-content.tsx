@@ -1,4 +1,5 @@
 "use client";
+import { MeetingNotes } from '@/components/MeetingNotes';
 import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { MeetingSummary, SummaryProcessResponse } from '@/types';
@@ -8,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
+import { TranscriptRevisionNotice } from '@/components/MeetingDetails/TranscriptRevisionNotice';
 import { MeetingDetailsSplitView, type MeetingDetailsTab } from '@/components/MeetingDetails/MeetingDetailsSplitView';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 
@@ -18,6 +20,7 @@ import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useAutomaticSummaryReadiness } from '@/hooks/useAutomaticSummaryReadiness';
 
 export default function PageContent({
   meeting,
@@ -103,6 +106,7 @@ export default function PageContent({
         whisperModel: config.whisperModel,
         apiKey: config.apiKey ?? null,
         ollamaEndpoint: config.ollamaEndpoint ?? null,
+        codexBinaryPath: config.codexBinaryPath ?? null,
       });
 
       // Emit event so ConfigContext and other listeners stay in sync
@@ -157,10 +161,13 @@ export default function PageContent({
     }
   }, [meeting.id, meetingData.aiSummary, summaryGeneration.summaryStatus]);
 
-  // Auto-generate only after the model configuration has settled.
+  const automaticSummary = useAutomaticSummaryReadiness(meeting.id, shouldAutoGenerate, onRefetchTranscripts);
+
+  // Auto-generate only after model configuration and the final transcription have settled.
   useEffect(() => {
     if (
       !shouldAutoGenerate
+      || !automaticSummary.ready
       || summaryGeneration.summaryStatus !== 'idle'
       || isModelConfigLoading
       || meetingData.transcripts.length === 0
@@ -171,10 +178,13 @@ export default function PageContent({
 
     autoGenerationStartedMeetingIdRef.current = meeting.id;
     console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
+    if (automaticSummary.message) toast.info(automaticSummary.message, { duration: 8000 });
     onAutoGenerateComplete?.();
     void summaryGeneration.handleGenerateSummary('');
   }, [
     shouldAutoGenerate,
+    automaticSummary.ready,
+    automaticSummary.message,
     meeting.id,
     meetingData.transcripts.length,
     isModelConfigLoading,
@@ -185,6 +195,11 @@ export default function PageContent({
     onAutoGenerateComplete,
   ]);
 
+  const cancelPendingAutoSummary = () => {
+    autoGenerationStartedMeetingIdRef.current = meeting.id;
+    onAutoGenerateComplete?.();
+  };
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
@@ -192,6 +207,12 @@ export default function PageContent({
       transition={{ duration: 0.3, ease: 'easeOut' }}
       className="flex flex-col h-screen min-w-0 bg-gray-50"
     >
+      {automaticSummary.message && <div role={automaticSummary.error ? 'alert' : 'status'} className="border-b bg-amber-50 px-5 py-3 text-sm text-amber-900">
+        {automaticSummary.message}
+        {automaticSummary.error && <button type="button" className="ml-2 underline" onClick={automaticSummary.retry}>Повторить проверку</button>}
+      </div>}
+      <MeetingNotes key={meeting.id} meetingId={meeting.id} />
+      <TranscriptRevisionNotice meetingId={meeting.id} summaryStatus={summaryGeneration.summaryStatus} />
       <div className="flex flex-1 min-w-0 overflow-hidden">
         <MeetingDetailsSplitView
           activeTab={activeTab}
@@ -235,14 +256,14 @@ export default function PageContent({
               modelConfig={modelConfig}
               setModelConfig={setModelConfig}
               onSaveModelConfig={handleSaveModelConfig}
-              onGenerateSummary={summaryGeneration.handleGenerateSummary}
-              onStopGeneration={summaryGeneration.handleStopGeneration}
+              onGenerateSummary={prompt => { cancelPendingAutoSummary(); return summaryGeneration.handleGenerateSummary(prompt); }}
+              onStopGeneration={() => { cancelPendingAutoSummary(); return summaryGeneration.handleStopGeneration(); }}
               customPrompt={customPrompt}
               onSaveSummary={meetingData.handleSaveSummary}
               onSummaryChange={meetingData.handleSummaryChange}
               onDirtyChange={meetingData.setIsSummaryDirty}
               summaryError={summaryGeneration.summaryError}
-              onRegenerateSummary={summaryGeneration.handleRegenerateSummary}
+              onRegenerateSummary={() => { cancelPendingAutoSummary(); return summaryGeneration.handleRegenerateSummary(); }}
               getSummaryStatusMessage={summaryGeneration.getSummaryStatusMessage}
               availableTemplates={templates.availableTemplates}
               selectedTemplate={templates.selectedTemplate}

@@ -69,7 +69,7 @@ export function TranscriptButtonGroup({
           <span className="hidden @[22rem]:inline">Recording</span>
         </Button>
 
-        {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
+        {betaFeatures.importAndRetranscribe && meetingId && (
           <Button
             size="sm"
             variant="outline"
@@ -78,10 +78,11 @@ export function TranscriptButtonGroup({
               Analytics.trackButtonClick('enhance_transcript', 'meeting_details');
               setShowRetranscribeDialog(true);
             }}
-            title="Retranscribe to enhance your recorded audio"
+            disabled={!meetingFolderPath}
+            title={meetingFolderPath ? "Распознать сохранённую запись другой моделью" : "У встречи нет сохранённой записи аудио для повторного распознавания"}
           >
             <RefreshCw className="@[22rem]:mr-2" size={18} />
-            <span className="hidden @[22rem]:inline">Enhance</span>
+            <span className="hidden @[22rem]:inline">Распознать заново</span>
           </Button>
         )}
       </ButtonGroup>

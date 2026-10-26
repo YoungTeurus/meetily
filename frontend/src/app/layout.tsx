@@ -1,6 +1,8 @@
 'use client'
 
 import './globals.css'
+import { usePathname } from 'next/navigation'
+import { CallPrompts } from '@/components/CallPrompts'
 import { Source_Sans_3 } from 'next/font/google'
 import Sidebar from '@/components/Sidebar'
 import { SidebarProvider } from '@/components/Sidebar/SidebarProvider'
@@ -63,7 +65,7 @@ function ConditionalImportDialog({
 
 // export { metadata } from './metadata'
 
-export default function RootLayout({
+function MainRootLayout({
   children,
 }: {
   children: React.ReactNode
@@ -244,6 +246,7 @@ export default function RootLayout({
                         <TooltipProvider>
                           <RecordingPostProcessingProvider>
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>
+                              {!showOnboarding && <CallPrompts />}
                               {/* Download progress toast provider - listens for background downloads */}
                               <DownloadProgressToastProvider />
 
@@ -280,4 +283,13 @@ export default function RootLayout({
       </body>
     </html>
   )
+}
+
+// Avoid mounting audio persistence providers again in the notification window.
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  if (pathname?.startsWith('/call-action')) {
+    return <html lang="ru"><body className={`${sourceSans3.variable} font-sans antialiased`}>{children}<Toaster richColors /></body></html>;
+  }
+  return <MainRootLayout>{children}</MainRootLayout>;
 }
